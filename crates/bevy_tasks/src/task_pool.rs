@@ -1,9 +1,16 @@
 use alloc::{boxed::Box, format, string::String, vec::Vec};
-use core::{future::Future, marker::PhantomData, mem, panic::AssertUnwindSafe};
+use core::{future::Future, marker::PhantomData, mem, panic::AssertUnwindSafe, time::Duration};
 use std::{
     thread::{self, JoinHandle},
     thread_local,
+    time::Instant,
 };
+
+/// How long an idle pool thread keeps polling the task queues before it parks.
+///
+/// Long enough to bridge the gaps between the schedules and parallel sections of a
+/// typical frame, short enough that an idle application does not burn a core.
+const SPIN_BEFORE_PARK: Duration = Duration::from_micros(20);
 
 use crate::executor::FallibleTask;
 use bevy_platform::sync::Arc;
@@ -195,16 +202,10 @@ impl TaskPool {
                             let _destructor = CallOnDrop(on_thread_destroy);
                             loop {
                                 let res = std::panic::catch_unwind(|| {
-                                    let tick_forever = async move {
-                                        loop {
-                                            local_executor.tick().await;
-                                        }
-                                    };
-                                    block_on(ex.run(tick_forever.or(shutdown_rx.recv())))
+                                    Self::worker_loop(&ex, local_executor, &shutdown_rx)
                                 });
-                                if let Ok(value) = res {
-                                    // Use unwrap_err because we expect a Closed error
-                                    value.unwrap_err();
+                                if res.is_ok() {
+                                    // the shutdown channel closed
                                     break;
                                 }
                             }
@@ -218,6 +219,67 @@ impl TaskPool {
             executor,
             threads,
             shutdown_tx,
+        }
+    }
+
+    /// The body of one pool thread: run tasks, spin briefly when the queues run dry, then
+    /// park until a task is scheduled.
+    ///
+    /// The executor itself parks a thread the moment it finds no work, so every task spawned
+    /// after a short idle gap (the common case inside a game frame, between two schedules or
+    /// two `par_iter` calls) pays a full thread wake-up before it starts. Spinning for
+    /// [`SPIN_BEFORE_PARK`] first lets a thread pick up that task directly from the queue.
+    /// Returns when the pool is shut down; panics from tasks propagate to the caller.
+    fn worker_loop(
+        ex: &crate::executor::Executor<'static>,
+        local_executor: &crate::executor::LocalExecutor<'static>,
+        shutdown_rx: &async_channel::Receiver<()>,
+    ) {
+        loop {
+            // Fast path: drain the global and local queues without ever sleeping, and keep
+            // polling for a short while after they run dry.
+            let mut idle_since: Option<Instant> = None;
+            let mut spins: u32 = 0;
+            loop {
+                if ex.try_tick() || local_executor.try_tick() {
+                    idle_since = None;
+                    spins = 0;
+                    continue;
+                }
+                spins = spins.wrapping_add(1);
+                if spins % 32 == 0 {
+                    let now = Instant::now();
+                    let since = *idle_since.get_or_insert(now);
+                    if now.duration_since(since) >= SPIN_BEFORE_PARK {
+                        break;
+                    }
+                    if shutdown_rx.is_closed() {
+                        return;
+                    }
+                }
+                core::hint::spin_loop();
+            }
+
+            // Slow path: park until one task is scheduled (or the pool shuts down), run it,
+            // then go back to spinning.
+            let shut_down = block_on(async {
+                let tick = async {
+                    ex.tick().await;
+                    false
+                };
+                let local_tick = async {
+                    local_executor.tick().await;
+                    false
+                };
+                let shutdown = async {
+                    let _ = shutdown_rx.recv().await;
+                    true
+                };
+                tick.or(local_tick).or(shutdown).await
+            });
+            if shut_down {
+                return;
+            }
         }
     }
 
@@ -410,7 +472,7 @@ impl TaskPool {
         if spawned.is_empty() {
             Vec::new()
         } else {
-            block_on(async move {
+            block_on_spinning(async move {
                 let get_results = async {
                     let mut results = Vec::with_capacity(spawned.len());
                     while let Ok(task) = spawned.pop() {
@@ -618,6 +680,30 @@ impl Drop for TaskPool {
             }
         }
     }
+}
+
+/// Drives `future` to completion on the current thread, polling it for up to
+/// [`SPIN_BEFORE_PARK`] before falling back to [`block_on`], which parks the thread.
+///
+/// Scopes usually finish within microseconds of their last task, and a parked thread
+/// costs a full wake-up to resume; the short spin makes the common case free.
+fn block_on_spinning<F: Future>(future: F) -> F::Output {
+    let mut future = core::pin::pin!(future);
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+    let start = Instant::now();
+    let mut spins: u32 = 0;
+    loop {
+        if let core::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        spins = spins.wrapping_add(1);
+        if spins % 8 == 0 && start.elapsed() >= SPIN_BEFORE_PARK {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    block_on(future)
 }
 
 /// A [`TaskPool`] scope for running one or more non-`'static` futures.

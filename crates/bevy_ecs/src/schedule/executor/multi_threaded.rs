@@ -3,7 +3,11 @@ use bevy_platform::cell::SyncUnsafeCell;
 use bevy_platform::sync::Arc;
 use bevy_tasks::{ComputeTaskPool, Scope, TaskPool, ThreadExecutor};
 use concurrent_queue::ConcurrentQueue;
-use core::{any::Any, panic::AssertUnwindSafe};
+use core::{
+    any::Any,
+    panic::AssertUnwindSafe,
+    sync::atomic::{fence, AtomicUsize, Ordering},
+};
 use fixedbitset::FixedBitSet;
 #[cfg(feature = "std")]
 use std::eprintln;
@@ -85,11 +89,33 @@ struct SystemResult {
 }
 
 /// Runs the schedule using a thread pool. Non-conflicting systems can run in parallel.
+///
+/// # Design
+///
+/// Scheduling decisions (dependency counting, access-conflict checks and run-condition
+/// evaluation) happen under a mutex, exactly once per system. Systems that may run are
+/// not spawned as individual tasks; instead they are pushed onto a lock-free *claimable*
+/// queue and executed by a small number of long-lived *worker* tasks (at most one per
+/// thread of the [`ComputeTaskPool`]). A worker pops the next claimable system, runs it,
+/// reports its completion and immediately continues with the next one, so a chain of
+/// dependent systems runs on one thread with no task allocation and no thread hand-off
+/// between its links, while wide, conflict-free phases still fan out across the pool.
+///
+/// Workers never block on the scheduling mutex. Whichever thread holds it performs the
+/// bookkeeping for every completion that arrived in the meantime; a worker that fails to
+/// acquire it simply moves on to the next claimable system. Exclusive systems and systems
+/// that need `!Send` data keep their own tasks on the scope / main thread as before.
 pub struct MultiThreadedExecutor {
     /// The running state, protected by a mutex so that a reference to the executor can be shared across tasks.
     state: Mutex<ExecutorState>,
     /// Queue of system completion events.
     system_completion: ConcurrentQueue<SystemResult>,
+    /// Systems that passed their conflict checks and run conditions and are waiting for a worker.
+    claimable: ConcurrentQueue<usize>,
+    /// Number of worker tasks currently alive.
+    active_workers: AtomicUsize,
+    /// Upper bound on the number of workers alive at once (the compute pool's thread count).
+    max_workers: usize,
     /// Setting when true applies deferred system buffers after all systems have run
     apply_final_deferred: bool,
     /// When set, tells the executor that a thread has panicked.
@@ -128,6 +154,8 @@ pub struct ExecutorState {
     completed_systems: FixedBitSet,
     /// Systems that have run but have not had their buffers applied.
     unapplied_systems: FixedBitSet,
+    /// Spare bitsets handed to `ApplyDeferred` tasks so they do not allocate.
+    unapplied_scratch: Vec<FixedBitSet>,
 }
 
 /// References to data required by the executor.
@@ -155,6 +183,7 @@ impl SystemExecutor for MultiThreadedExecutor {
         let set_count = schedule.set_ids.len();
 
         self.system_completion = ConcurrentQueue::bounded(sys_count.max(1));
+        self.claimable = ConcurrentQueue::bounded(sys_count.max(1));
         self.starting_systems = FixedBitSet::with_capacity(sys_count);
         state.evaluated_sets = FixedBitSet::with_capacity(set_count);
         state.ready_systems = FixedBitSet::with_capacity(sys_count);
@@ -163,6 +192,7 @@ impl SystemExecutor for MultiThreadedExecutor {
         state.completed_systems = FixedBitSet::with_capacity(sys_count);
         state.skipped_systems = FixedBitSet::with_capacity(sys_count);
         state.unapplied_systems = FixedBitSet::with_capacity(sys_count);
+        state.unapplied_scratch.clear();
 
         state.system_task_metadata = Vec::with_capacity(sys_count);
         for index in 0..sys_count {
@@ -269,26 +299,30 @@ impl SystemExecutor for MultiThreadedExecutor {
             .map(|e| e.0.clone());
         let thread_executor = thread_executor.as_deref();
 
+        let pool = ComputeTaskPool::get_or_init(TaskPool::default);
+        self.max_workers = pool.thread_num().max(1);
+        debug_assert_eq!(self.active_workers.load(Ordering::Relaxed), 0);
+        debug_assert!(self.claimable.is_empty());
+
         let environment = &Environment::new(self, schedule, world);
 
-        ComputeTaskPool::get_or_init(TaskPool::default).scope_with_executor(
-            false,
-            thread_executor,
-            |scope| {
-                let context = Context {
-                    environment,
-                    scope,
-                    error_handler,
-                };
+        pool.scope_with_executor(false, thread_executor, |scope| {
+            let context = Context {
+                environment,
+                scope,
+                error_handler,
+            };
 
-                // The first tick won't need to process finished systems, but we still need to run the loop in
-                // tick_executor() in case a system completes while the first tick still holds the mutex.
-                context.tick_executor();
-            },
-        );
+            // The first tick won't need to process finished systems, but we still need to run the loop in
+            // tick_executor() in case a system completes while the first tick still holds the mutex.
+            context.tick_executor();
+        });
 
         // End the borrows of self and world in environment by copying out the reference to systems.
         let systems = environment.systems;
+
+        debug_assert_eq!(self.active_workers.load(Ordering::Relaxed), 0);
+        debug_assert!(self.claimable.is_empty());
 
         let state = self.state.get_mut().unwrap();
         if self.apply_final_deferred {
@@ -378,6 +412,54 @@ impl<'scope, 'env: 'scope, 'sys> Context<'scope, 'env, 'sys> {
             }
         }
     }
+
+    /// The body of a worker task: runs claimable systems until there are none left.
+    fn worker(&self) {
+        let executor = self.environment.executor;
+        loop {
+            let Ok(system_index) = executor.claimable.pop() else {
+                // Retire. The dispatcher counts live workers to decide whether to spawn new
+                // ones, so re-check the queue after decrementing: either it observes the
+                // decrement and spawns a replacement, or we observe its push and stay alive.
+                executor.active_workers.fetch_sub(1, Ordering::SeqCst);
+                fence(Ordering::SeqCst);
+                if executor.claimable.is_empty() {
+                    return;
+                }
+                executor.active_workers.fetch_add(1, Ordering::SeqCst);
+                continue;
+            };
+
+            // SAFETY: the dispatcher marked this system as running while holding the lock,
+            // so it is not borrowed anywhere else; it stays that way until we report completion.
+            let system =
+                &mut unsafe { &mut *self.environment.systems[system_index].get() }.system;
+
+            let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                // SAFETY:
+                // - The dispatcher verified that no running system conflicts with this one,
+                //   so we have permission to access the world data used by the system.
+                // - `is_exclusive` returned false for every claimable system.
+                unsafe {
+                    if let Err(RunSystemError::Failed(err)) =
+                        __rust_begin_short_backtrace::run_unsafe(
+                            system,
+                            self.environment.world_cell,
+                        )
+                    {
+                        (self.error_handler)(
+                            err,
+                            ErrorContext::System {
+                                name: system.name(),
+                                last_run: system.get_last_run(),
+                            },
+                        );
+                    }
+                };
+            }));
+            self.system_completed(system_index, res, system);
+        }
+    }
 }
 
 impl MultiThreadedExecutor {
@@ -388,6 +470,9 @@ impl MultiThreadedExecutor {
         Self {
             state: Mutex::new(ExecutorState::new()),
             system_completion: ConcurrentQueue::unbounded(),
+            claimable: ConcurrentQueue::unbounded(),
+            active_workers: AtomicUsize::new(0),
+            max_workers: 1,
             starting_systems: FixedBitSet::new(),
             apply_final_deferred: true,
             panic_payload: Mutex::new(None),
@@ -413,6 +498,7 @@ impl ExecutorState {
             skipped_systems: FixedBitSet::new(),
             completed_systems: FixedBitSet::new(),
             unapplied_systems: FixedBitSet::new(),
+            unapplied_scratch: Vec::new(),
         }
     }
 
@@ -515,7 +601,9 @@ impl ExecutorState {
                 self.running_systems.insert(system_index);
                 self.num_running_systems += 1;
 
-                if self.system_task_metadata[system_index].is_exclusive {
+                let system_meta = &self.system_task_metadata[system_index];
+
+                if system_meta.is_exclusive {
                     // SAFETY: `can_run` returned true for this system,
                     // which means no systems are currently borrowed.
                     unsafe {
@@ -525,24 +613,64 @@ impl ExecutorState {
                     break;
                 }
 
-                // SAFETY:
-                // - Caller ensured no other reference to this system exists.
-                // - `system_task_metadata[system_index].is_exclusive` is `false`,
-                //   so `System::is_exclusive` returned `false` when we called it.
-                // - `can_run` returned true, so no systems with conflicting world access are running.
-                unsafe {
-                    self.spawn_system_task(context, system_index);
+                if !system_meta.is_send {
+                    // SAFETY:
+                    // - Caller ensured no other reference to this system exists.
+                    // - `system_task_metadata[system_index].is_exclusive` is `false`,
+                    //   so `System::is_exclusive` returned `false` when we called it.
+                    // - `can_run` returned true, so no systems with conflicting world access are running.
+                    unsafe {
+                        self.spawn_local_system_task(context, system_index);
+                    }
+                    continue;
                 }
+
+                // Hand the system to a worker. The queue is bounded to the number of systems
+                // and each system is pushed at most once per run, so it never fills up.
+                context
+                    .environment
+                    .executor
+                    .claimable
+                    .push(system_index)
+                    .unwrap_or_else(|error| unreachable!("{}", error));
             }
         }
 
         // give back
         self.ready_systems_copy = ready_systems;
+
+        self.spawn_workers(context);
+    }
+
+    /// Makes sure enough workers are alive to drain the claimable queue.
+    fn spawn_workers(&self, context: &Context) {
+        let executor = context.environment.executor;
+        let pending = executor.claimable.len();
+        if pending == 0 {
+            return;
+        }
+        // Pair with the fence in `Context::worker`: a retiring worker either sees our pushes
+        // or we see its decrement, so claimable systems can never be left without a worker.
+        fence(Ordering::SeqCst);
+        let alive = executor.active_workers.load(Ordering::SeqCst);
+        let wanted = pending.min(executor.max_workers).saturating_sub(alive);
+        for _ in 0..wanted {
+            executor.active_workers.fetch_add(1, Ordering::SeqCst);
+            let context = *context;
+            context.scope.spawn(async move {
+                context.worker();
+            });
+        }
     }
 
     fn can_run(&mut self, system_index: usize, conditions: &mut Conditions) -> bool {
+        // Nothing is running, so nothing can conflict.
+        if self.num_running_systems == 0 {
+            return true;
+        }
+
         let system_meta = &self.system_task_metadata[system_index];
-        if system_meta.is_exclusive && self.num_running_systems > 0 {
+        if system_meta.is_exclusive {
             return false;
         }
 
@@ -642,18 +770,18 @@ impl ExecutorState {
         should_run
     }
 
+    /// Spawns a task for a system that needs `!Send` data, on the main thread.
+    ///
     /// # Safety
     /// - Caller must not alias systems that are running.
     /// - `is_exclusive` must have returned `false` for the specified system.
     /// - `world` must have permission to access the world data
     ///   used by the specified system.
-    unsafe fn spawn_system_task(&mut self, context: &Context, system_index: usize) {
+    unsafe fn spawn_local_system_task(&mut self, context: &Context, system_index: usize) {
         // SAFETY: this system is not running, no other reference exists
         let system = &mut unsafe { &mut *context.environment.systems[system_index].get() }.system;
         // Move the full context object into the new future.
         let context = *context;
-
-        let system_meta = &self.system_task_metadata[system_index];
 
         let task = async move {
             let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -681,12 +809,8 @@ impl ExecutorState {
             context.system_completed(system_index, res, system);
         };
 
-        if system_meta.is_send {
-            context.scope.spawn(task);
-        } else {
-            self.local_thread_running = true;
-            context.scope.spawn_on_external(task);
-        }
+        self.local_thread_running = true;
+        context.scope.spawn_on_external(task);
     }
 
     /// # Safety
@@ -698,14 +822,24 @@ impl ExecutorState {
         let context = *context;
 
         if is_apply_deferred(&**system) {
-            // TODO: avoid allocation
-            let unapplied_systems = self.unapplied_systems.clone();
-            self.unapplied_systems.clear();
+            // Hand the set of unapplied systems to the task without allocating: swap in a
+            // spare bitset (or an empty one on the first use, which allocates once).
+            let mut unapplied_systems = self.unapplied_scratch.pop().unwrap_or_default();
+            unapplied_systems.clear();
+            unapplied_systems.grow(self.unapplied_systems.len());
+            core::mem::swap(&mut unapplied_systems, &mut self.unapplied_systems);
             let task = async move {
                 // SAFETY: `can_run` returned true for this system, which means
                 // that no other systems currently have access to the world.
                 let world = unsafe { context.environment.world_cell.world_mut() };
                 let res = apply_deferred(&unapplied_systems, context.environment.systems, world);
+                // Return the bitset for reuse. Nothing else can hold the lock for long right now
+                // (an exclusive system is running), but never block on it.
+                let mut unapplied_systems = unapplied_systems;
+                if let Ok(mut state) = context.environment.executor.state.try_lock() {
+                    unapplied_systems.clear();
+                    state.unapplied_scratch.push(unapplied_systems);
+                }
                 context.system_completed(system_index, res, system);
             };
 
@@ -860,11 +994,13 @@ impl MainThreadExecutor {
 #[cfg(test)]
 mod tests {
     use crate::{
-        prelude::Resource,
+        prelude::{ResMut, Resource, SystemSet},
         schedule::{IntoScheduleConfigs, MultiThreadedExecutor, Schedule},
-        system::Commands,
+        system::{Commands, NonSendMarker},
         world::World,
     };
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Resource)]
     struct R;
@@ -898,5 +1034,90 @@ mod tests {
         schedule.set_executor(MultiThreadedExecutor::new());
         schedule.add_systems(((|_: Commands| {}), |_: Commands| {}).chain());
         schedule.run(&mut world);
+    }
+
+    #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
+    struct Link(usize);
+
+    #[derive(Resource, Default)]
+    struct Log(Vec<usize>);
+
+    /// A long dependency chain mixed with an exclusive system, an `ApplyDeferred` and a
+    /// `!Send` system, run many times: every system must run exactly once per schedule
+    /// run and the chain must stay in order.
+    #[test]
+    fn workers_run_every_system_once_in_order() {
+        let mut world = World::new();
+        world.init_resource::<Log>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+
+        const LINKS: usize = 64;
+        for i in 0..LINKS {
+            schedule.add_systems((move |mut log: ResMut<Log>| log.0.push(i)).in_set(Link(i)));
+            if i > 0 {
+                schedule.configure_sets(Link(i).after(Link(i - 1)));
+            }
+        }
+        schedule.add_systems(
+            (
+                |mut commands: Commands| commands.insert_resource(R),
+                |world: &mut World| {
+                    assert!(world.contains_resource::<R>());
+                    world.resource_mut::<Log>().0.push(1000);
+                },
+                |_: NonSendMarker, mut log: ResMut<Log>| log.0.push(2000),
+            )
+                .chain(),
+        );
+        for _ in 0..200 {
+            world.remove_resource::<R>();
+            world.resource_mut::<Log>().0.clear();
+            schedule.run(&mut world);
+            let log = &world.resource::<Log>().0;
+            let chain: Vec<usize> = log.iter().copied().filter(|&x| x < LINKS).collect();
+            assert_eq!(chain, (0..LINKS).collect::<Vec<_>>());
+            assert_eq!(log.iter().filter(|&&x| x == 1000).count(), 1);
+            assert_eq!(log.iter().filter(|&&x| x == 2000).count(), 1);
+            assert_eq!(log.len(), LINKS + 2);
+            assert!(world.get_resource::<R>().is_some());
+        }
+    }
+
+    /// Many independent systems with no conflicts: the wide, fan-out case.
+    #[test]
+    fn workers_fan_out() {
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let mut world = World::new();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        for _ in 0..500 {
+            schedule.add_systems(|| {
+                COUNT.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        for run in 1..=20 {
+            schedule.run(&mut world);
+            assert_eq!(COUNT.load(Ordering::Relaxed), 500 * run);
+        }
+    }
+
+    /// Systems that all conflict on one resource: only one may run at a time, and every
+    /// one of them must still run.
+    #[test]
+    fn workers_serialize_conflicting_systems() {
+        #[derive(Resource, Default)]
+        struct Counter(usize);
+        let mut world = World::new();
+        world.init_resource::<Counter>();
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        for _ in 0..200 {
+            schedule.add_systems(|mut c: ResMut<Counter>| c.0 += 1);
+        }
+        for run in 1..=20 {
+            schedule.run(&mut world);
+            assert_eq!(world.resource::<Counter>().0, 200 * run);
+        }
     }
 }
