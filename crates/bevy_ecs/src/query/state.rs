@@ -1537,84 +1537,116 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter,QueryState::par_fold_init_unchecked_manual,
         // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
         use arrayvec::ArrayVec;
+        use core::sync::atomic::{AtomicUsize, Ordering};
 
-        bevy_tasks::ComputeTaskPool::get().scope(|scope| {
-            // SAFETY: We only access table data that has been registered in `self.component_access`.
-            let tables = unsafe { &world.storages().tables };
-            let archetypes = world.archetypes();
-            let mut batch_queue = ArrayVec::new();
-            let mut queue_entity_count = 0;
+        /// One unit of parallel work: a contiguous range of one storage, or a group of
+        /// storages that are each smaller than a batch.
+        enum Item {
+            Range(StorageId, core::ops::Range<u32>),
+            Group(ArrayVec<StorageId, 128>),
+        }
 
-            // submit a list of storages which smaller than batch_size as single task
-            let submit_batch_queue = |queue: &mut ArrayVec<StorageId, 128>| {
-                if queue.is_empty() {
-                    return;
+        // SAFETY: We only access table data that has been registered in `self.component_access`.
+        let tables = unsafe { &world.storages().tables };
+        let archetypes = world.archetypes();
+        let storage_entity_count = |storage_id: StorageId| -> u32 {
+            if self.is_dense {
+                tables[storage_id.table_id].entity_count()
+            } else {
+                archetypes[storage_id.archetype_id].len()
+            }
+        };
+
+        // Cut the matched storages into batches up front. Batches are not tasks: they are
+        // pulled from a shared counter by a fixed number of workers, so a small batch size
+        // buys load balancing without buying task spawns.
+        let mut items: Vec<Item> = Vec::new();
+        let mut group: ArrayVec<StorageId, 128> = ArrayVec::new();
+        let mut group_entity_count = 0u32;
+        for storage_id in &self.matched_storage_ids {
+            let count = storage_entity_count(*storage_id);
+            // skip empty storage
+            if count == 0 {
+                continue;
+            }
+            // a storage at least one batch long is split into ranges
+            if count >= batch_size {
+                for offset in (0..count).step_by(batch_size as usize) {
+                    let len = batch_size.min(count - offset);
+                    items.push(Item::Range(*storage_id, offset..offset + len));
                 }
-                let queue = core::mem::take(queue);
-                let mut func = func.clone();
+                continue;
+            }
+            // smaller storages are merged until they add up to a batch
+            group.push(*storage_id);
+            group_entity_count += count;
+            if group_entity_count >= batch_size || group.is_full() {
+                items.push(Item::Group(core::mem::take(&mut group)));
+                group_entity_count = 0;
+            }
+        }
+        if !group.is_empty() {
+            items.push(Item::Group(group));
+        }
+        if items.is_empty() {
+            return;
+        }
+
+        let pool = bevy_tasks::ComputeTaskPool::get();
+        let workers = items.len().min(pool.thread_num().max(1));
+        let next = AtomicUsize::new(0);
+        let items = &items;
+        let next = &next;
+
+        // Runs on every worker, including the calling thread: keep pulling batches until
+        // the counter runs past the end.
+        let work = move |mut func: FN, init_accum: INIT| {
+            #[cfg(feature = "trace")]
+            let _span = self.par_iter_span.enter();
+            // SAFETY: upheld by the caller of this function.
+            let mut iter = unsafe {
+                self.query_unchecked_manual_with_ticks(world, last_run, this_run)
+                    .into_iter()
+            };
+            let mut accum = init_accum();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(index) else {
+                    break;
+                };
+                accum = match item {
+                    // SAFETY: the range was cut from this storage's entity count above.
+                    Item::Range(storage_id, range) => unsafe {
+                        iter.fold_over_storage_range(
+                            accum,
+                            &mut func,
+                            *storage_id,
+                            Some(range.clone()),
+                        )
+                    },
+                    Item::Group(storages) => {
+                        for storage_id in storages {
+                            // SAFETY: `None` covers the whole storage.
+                            accum = unsafe {
+                                iter.fold_over_storage_range(accum, &mut func, *storage_id, None)
+                            };
+                        }
+                        accum
+                    }
+                };
+            }
+        };
+
+        pool.scope(|scope| {
+            for _ in 1..workers {
+                let func = func.clone();
                 let init_accum = init_accum.clone();
                 scope.spawn(async move {
-                    #[cfg(feature = "trace")]
-                    let _span = self.par_iter_span.enter();
-                    let mut iter = self
-                        .query_unchecked_manual_with_ticks(world, last_run, this_run)
-                        .into_iter();
-                    let mut accum = init_accum();
-                    for storage_id in queue {
-                        accum = iter.fold_over_storage_range(accum, &mut func, storage_id, None);
-                    }
+                    work(func, init_accum);
                 });
-            };
-
-            // submit single storage larger than batch_size
-            let submit_single = |count, storage_id: StorageId| {
-                for offset in (0..count).step_by(batch_size as usize) {
-                    let mut func = func.clone();
-                    let init_accum = init_accum.clone();
-                    let len = batch_size.min(count - offset);
-                    let batch = offset..offset + len;
-                    scope.spawn(async move {
-                        #[cfg(feature = "trace")]
-                        let _span = self.par_iter_span.enter();
-                        let accum = init_accum();
-                        self.query_unchecked_manual_with_ticks(world, last_run, this_run)
-                            .into_iter()
-                            .fold_over_storage_range(accum, &mut func, storage_id, Some(batch));
-                    });
-                }
-            };
-
-            let storage_entity_count = |storage_id: StorageId| -> u32 {
-                if self.is_dense {
-                    tables[storage_id.table_id].entity_count()
-                } else {
-                    archetypes[storage_id.archetype_id].len()
-                }
-            };
-
-            for storage_id in &self.matched_storage_ids {
-                let count = storage_entity_count(*storage_id);
-
-                // skip empty storage
-                if count == 0 {
-                    continue;
-                }
-                // immediately submit large storage
-                if count >= batch_size {
-                    submit_single(count, *storage_id);
-                    continue;
-                }
-                // merge small storage
-                batch_queue.push(*storage_id);
-                queue_entity_count += count;
-
-                // submit batch_queue
-                if queue_entity_count >= batch_size || batch_queue.is_full() {
-                    submit_batch_queue(&mut batch_queue);
-                    queue_entity_count = 0;
-                }
             }
-            submit_batch_queue(&mut batch_queue);
+            // The calling thread takes the share it would otherwise spend waiting.
+            work(func, init_accum);
         });
     }
 
@@ -1641,7 +1673,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         world: UnsafeWorldCell<'w>,
         entity_list: &UniqueEntityEquivalentSlice<E>,
         batch_size: u32,
-        mut func: FN,
+        func: FN,
         last_run: Tick,
         this_run: Tick,
     ) where
@@ -1654,29 +1686,48 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter,QueryState::par_fold_init_unchecked_manual
         // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
 
-        bevy_tasks::ComputeTaskPool::get().scope(|scope| {
-            let chunks = entity_list.chunks_exact(batch_size as usize);
-            let remainder = chunks.remainder();
+        use core::sync::atomic::{AtomicUsize, Ordering};
 
-            for batch in chunks {
-                let mut func = func.clone();
-                let init_accum = init_accum.clone();
-                scope.spawn(async move {
-                    #[cfg(feature = "trace")]
-                    let _span = self.par_iter_span.enter();
-                    let accum = init_accum();
-                    self.query_unchecked_manual_with_ticks(world, last_run, this_run)
-                        .iter_many_unique_inner(batch)
-                        .fold(accum, &mut func);
-                });
-            }
+        if entity_list.is_empty() {
+            return;
+        }
+        // Batches are pulled from a shared counter by a fixed number of workers (the
+        // calling thread included), so the batch size sets load-balancing granularity
+        // rather than the number of tasks spawned.
+        let batch_size = (batch_size as usize).max(1);
+        let batches = entity_list.len().div_ceil(batch_size);
+        let pool = bevy_tasks::ComputeTaskPool::get();
+        let workers = batches.min(pool.thread_num().max(1));
+        let next = AtomicUsize::new(0);
+        let next = &next;
 
+        let work = move |mut func: FN, init_accum: INIT| {
             #[cfg(feature = "trace")]
             let _span = self.par_iter_span.enter();
-            let accum = init_accum();
-            self.query_unchecked_manual_with_ticks(world, last_run, this_run)
-                .iter_many_unique_inner(remainder)
-                .fold(accum, &mut func);
+            let mut accum = init_accum();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= batches {
+                    break;
+                }
+                let start = index * batch_size;
+                let batch = &entity_list[start..(start + batch_size).min(entity_list.len())];
+                // SAFETY: upheld by the caller of this function.
+                accum = unsafe { self.query_unchecked_manual_with_ticks(world, last_run, this_run) }
+                    .iter_many_unique_inner(batch)
+                    .fold(accum, &mut func);
+            }
+        };
+
+        pool.scope(|scope| {
+            for _ in 1..workers {
+                let func = func.clone();
+                let init_accum = init_accum.clone();
+                scope.spawn(async move {
+                    work(func, init_accum);
+                });
+            }
+            work(func, init_accum);
         });
     }
 }
@@ -1705,7 +1756,7 @@ impl<D: ReadOnlyQueryData, F: QueryFilter> QueryState<D, F> {
         world: UnsafeWorldCell<'w>,
         entity_list: &[E],
         batch_size: u32,
-        mut func: FN,
+        func: FN,
         last_run: Tick,
         this_run: Tick,
     ) where
@@ -1717,29 +1768,48 @@ impl<D: ReadOnlyQueryData, F: QueryFilter> QueryState<D, F> {
         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter, QueryState::par_fold_init_unchecked_manual
         // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
 
-        bevy_tasks::ComputeTaskPool::get().scope(|scope| {
-            let chunks = entity_list.chunks_exact(batch_size as usize);
-            let remainder = chunks.remainder();
+        use core::sync::atomic::{AtomicUsize, Ordering};
 
-            for batch in chunks {
-                let mut func = func.clone();
-                let init_accum = init_accum.clone();
-                scope.spawn(async move {
-                    #[cfg(feature = "trace")]
-                    let _span = self.par_iter_span.enter();
-                    let accum = init_accum();
-                    self.query_unchecked_manual_with_ticks(world, last_run, this_run)
-                        .iter_many_inner(batch)
-                        .fold(accum, &mut func);
-                });
-            }
+        if entity_list.is_empty() {
+            return;
+        }
+        // Batches are pulled from a shared counter by a fixed number of workers (the
+        // calling thread included), so the batch size sets load-balancing granularity
+        // rather than the number of tasks spawned.
+        let batch_size = (batch_size as usize).max(1);
+        let batches = entity_list.len().div_ceil(batch_size);
+        let pool = bevy_tasks::ComputeTaskPool::get();
+        let workers = batches.min(pool.thread_num().max(1));
+        let next = AtomicUsize::new(0);
+        let next = &next;
 
+        let work = move |mut func: FN, init_accum: INIT| {
             #[cfg(feature = "trace")]
             let _span = self.par_iter_span.enter();
-            let accum = init_accum();
-            self.query_unchecked_manual_with_ticks(world, last_run, this_run)
-                .iter_many_inner(remainder)
-                .fold(accum, &mut func);
+            let mut accum = init_accum();
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= batches {
+                    break;
+                }
+                let start = index * batch_size;
+                let batch = &entity_list[start..(start + batch_size).min(entity_list.len())];
+                // SAFETY: upheld by the caller of this function.
+                accum = unsafe { self.query_unchecked_manual_with_ticks(world, last_run, this_run) }
+                    .iter_many_inner(batch)
+                    .fold(accum, &mut func);
+            }
+        };
+
+        pool.scope(|scope| {
+            for _ in 1..workers {
+                let func = func.clone();
+                let init_accum = init_accum.clone();
+                scope.spawn(async move {
+                    work(func, init_accum);
+                });
+            }
+            work(func, init_accum);
         });
     }
 }
