@@ -12,6 +12,9 @@ use std::{
 /// typical frame, short enough that an idle application does not burn a core.
 const SPIN_BEFORE_PARK: Duration = Duration::from_micros(20);
 
+/// Whether idle pool threads back off between polls of the shared queue.
+const SPIN_BACKOFF: bool = false;
+
 use crate::executor::FallibleTask;
 use bevy_platform::sync::Arc;
 use concurrent_queue::ConcurrentQueue;
@@ -240,10 +243,16 @@ impl TaskPool {
             // polling for a short while after they run dry.
             let mut idle_since: Option<Instant> = None;
             let mut spins: u32 = 0;
+            let mut ticks: u32 = 0;
             loop {
                 if ex.try_tick() || local_executor.try_tick() {
                     idle_since = None;
                     spins = 0;
+                    ticks = ticks.wrapping_add(1);
+                    // A continuously busy thread must still notice a shutdown.
+                    if ticks % 64 == 0 && shutdown_rx.is_closed() {
+                        return;
+                    }
                     continue;
                 }
                 spins = spins.wrapping_add(1);
@@ -257,7 +266,13 @@ impl TaskPool {
                         return;
                     }
                 }
-                core::hint::spin_loop();
+                // Poll less and less often while idle (up to ~0.5 us between polls) so that
+                // a full pool of spinning threads does not keep the queue's cache lines
+                // bouncing for the thread that is about to push.
+                let pause = if SPIN_BACKOFF { 1u32 << spins.min(5) } else { 1 };
+                for _ in 0..pause {
+                    core::hint::spin_loop();
+                }
             }
 
             // Slow path: park until one task is scheduled (or the pool shuts down), run it,
@@ -535,17 +550,23 @@ impl TaskPool {
         // task errors it will panic the scope on the call to get_results
         let execute_forever = async move {
             loop {
+                // `tick` runs one task straight from the shared queue. The former
+                // `executor.run` created a Runner with a private local queue that stole
+                // half of the shared queue; pool threads now poll the shared queue
+                // directly and cannot steal from such a private queue, so a Runner here
+                // would strand tasks on this thread for as long as the scope lasts.
                 let tick_forever = async {
                     loop {
-                        external_ticker.tick().or(scope_ticker.tick()).await;
+                        external_ticker
+                            .tick()
+                            .or(scope_ticker.tick())
+                            .or(executor.tick())
+                            .await;
                     }
                 };
                 // we don't care if it errors. If a scoped task errors it will propagate
                 // to get_results
-                let _result = AssertUnwindSafe(executor.run(tick_forever))
-                    .catch_unwind()
-                    .await
-                    .is_ok();
+                let _result = AssertUnwindSafe(tick_forever).catch_unwind().await.is_ok();
             }
         };
         get_results.or(execute_forever).await
@@ -578,15 +599,14 @@ impl TaskPool {
     ) -> Vec<T> {
         let execute_forever = async {
             loop {
+                // See `execute_global_external_scope` for why this ticks the shared
+                // queue directly instead of running a Runner.
                 let tick_forever = async {
                     loop {
-                        scope_ticker.tick().await;
+                        scope_ticker.tick().or(executor.tick()).await;
                     }
                 };
-                let _result = AssertUnwindSafe(executor.run(tick_forever))
-                    .catch_unwind()
-                    .await
-                    .is_ok();
+                let _result = AssertUnwindSafe(tick_forever).catch_unwind().await.is_ok();
             }
         };
         get_results.or(execute_forever).await

@@ -1536,14 +1536,13 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // NOTE: If you are changing query iteration code, remember to update the following places, where relevant:
         // QueryIter, QueryIterationCursor, QueryManyIter, QueryCombinationIter,QueryState::par_fold_init_unchecked_manual,
         // QueryState::par_many_fold_init_unchecked_manual, QueryState::par_many_unique_fold_init_unchecked_manual, QueryContiguousIter::next
-        use arrayvec::ArrayVec;
         use core::sync::atomic::{AtomicUsize, Ordering};
 
         /// One unit of parallel work: a contiguous range of one storage, or a group of
-        /// storages that are each smaller than a batch.
+        /// storages (a range into `grouped`) that are each smaller than a batch.
         enum Item {
             Range(StorageId, core::ops::Range<u32>),
-            Group(ArrayVec<StorageId, 128>),
+            Group(core::ops::Range<usize>),
         }
 
         // SAFETY: We only access table data that has been registered in `self.component_access`.
@@ -1561,7 +1560,9 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // pulled from a shared counter by a fixed number of workers, so a small batch size
         // buys load balancing without buying task spawns.
         let mut items: Vec<Item> = Vec::new();
-        let mut group: ArrayVec<StorageId, 128> = ArrayVec::new();
+        // storages too small for a batch of their own, grouped in order
+        let mut grouped: Vec<StorageId> = Vec::new();
+        let mut group_start = 0usize;
         let mut group_entity_count = 0u32;
         for storage_id in &self.matched_storage_ids {
             let count = storage_entity_count(*storage_id);
@@ -1578,15 +1579,16 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
                 continue;
             }
             // smaller storages are merged until they add up to a batch
-            group.push(*storage_id);
+            grouped.push(*storage_id);
             group_entity_count += count;
-            if group_entity_count >= batch_size || group.is_full() {
-                items.push(Item::Group(core::mem::take(&mut group)));
+            if group_entity_count >= batch_size {
+                items.push(Item::Group(group_start..grouped.len()));
+                group_start = grouped.len();
                 group_entity_count = 0;
             }
         }
-        if !group.is_empty() {
-            items.push(Item::Group(group));
+        if group_start < grouped.len() {
+            items.push(Item::Group(group_start..grouped.len()));
         }
         if items.is_empty() {
             return;
@@ -1596,6 +1598,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         let workers = items.len().min(pool.thread_num().max(1));
         let next = AtomicUsize::new(0);
         let items = &items;
+        let grouped = &grouped;
         let next = &next;
 
         // Runs on every worker, including the calling thread: keep pulling batches until
@@ -1624,8 +1627,8 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
                             Some(range.clone()),
                         )
                     },
-                    Item::Group(storages) => {
-                        for storage_id in storages {
+                    Item::Group(range) => {
+                        for storage_id in &grouped[range.clone()] {
                             // SAFETY: `None` covers the whole storage.
                             accum = unsafe {
                                 iter.fold_over_storage_range(accum, &mut func, *storage_id, None)
