@@ -37,7 +37,7 @@ bevy_platform = { path = "../bevy_platform", version = "0.19.1", default-feature
 ] }
 
 # other
-taffy = { version = "0.10", default-features = false, features = [
+taffy = { version = "0.10", optional = true, default-features = false, features = [
   "std",
   "block_layout",
   "flexbox",
@@ -67,6 +67,10 @@ serialize = [
   "bevy_platform/serialize",
 ]
 bevy_picking = ["dep:bevy_picking", "dep:uuid"]
+# The taffy layout: `ui_layout_system` sizes and places every node from its
+# flexbox or grid `Node` style. Without it, an app lays out UI nodes itself
+# in `UiLayoutSystems::Compute`.
+taffy_layout = ["dep:taffy"]
 
 # Experimental features
 ghost_nodes = []

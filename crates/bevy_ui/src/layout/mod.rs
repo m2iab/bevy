@@ -3,8 +3,8 @@ use crate::experimental::GhostNode;
 use crate::{
     experimental::{UiChildren, UiRootNodes},
     ui_transform::{UiGlobalTransform, UiTransform},
-    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, IgnoreScroll, LayoutConfig, Node,
-    OverflowAxis, ScrollPosition,
+    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, IgnoreScroll, LayoutConfig,
+    LayoutContext, Node, OverflowAxis, ScrollPosition,
 };
 #[cfg(feature = "ghost_nodes")]
 use bevy_ecs::query::With;
@@ -30,40 +30,6 @@ use bevy_text::FontCx;
 mod convert;
 pub mod debug;
 pub mod ui_surface;
-
-pub struct LayoutContext {
-    pub scale_factor: f32,
-    pub physical_size: Vec2,
-}
-
-impl LayoutContext {
-    pub const DEFAULT: Self = Self {
-        scale_factor: 1.0,
-        physical_size: Vec2::ZERO,
-    };
-    /// Create a new [`LayoutContext`] from the window's physical size and scale factor
-    #[inline]
-    const fn new(scale_factor: f32, physical_size: Vec2) -> Self {
-        Self {
-            scale_factor,
-            physical_size,
-        }
-    }
-}
-
-#[cfg(test)]
-impl LayoutContext {
-    pub const TEST_CONTEXT: Self = Self {
-        scale_factor: 1.0,
-        physical_size: Vec2::new(1000.0, 1000.0),
-    };
-}
-
-impl Default for LayoutContext {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum LayoutError {

@@ -33,6 +33,7 @@ mod accessibility;
 pub mod experimental;
 mod focus;
 mod geometry;
+#[cfg(feature = "taffy_layout")]
 mod layout;
 mod stack;
 mod ui_node;
@@ -44,6 +45,7 @@ pub use gradients::*;
 pub use interaction_states::{
     Checkable, Checked, InteractionDisabled, Pressed, Selectable, Selected,
 };
+#[cfg(feature = "taffy_layout")]
 pub use layout::*;
 pub use measurement::*;
 pub use ui_node::*;
@@ -80,6 +82,7 @@ use bevy_app::{prelude::*, AnimationSystems, HierarchyPropagatePlugin, Propagate
 use bevy_camera::CameraUpdateSystems;
 use bevy_ecs::prelude::*;
 use bevy_input::InputSystems;
+#[cfg(feature = "taffy_layout")]
 use layout::ui_surface::UiSurface;
 use stack::ui_stack_system;
 pub use stack::{ComputedStackIndex, UiStack};
@@ -123,7 +126,8 @@ pub enum UiSystems {
 pub enum UiLayoutSystems {
     /// Computes the size and position of every UI node.
     ///
-    /// Contains [`ui_layout_system`].
+    /// Contains `ui_layout_system` with the `taffy_layout` feature. Without it,
+    /// an app lays out its UI nodes here itself.
     Compute,
     /// Resolves the computed values that depend on a node's size, such as its border radius and outline.
     ///
@@ -157,8 +161,9 @@ struct AmbiguousWithUpdateText2dLayout;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<UiSurface>()
-            .init_resource::<UiScale>()
+        #[cfg(feature = "taffy_layout")]
+        app.init_resource::<UiSurface>();
+        app.init_resource::<UiScale>()
             .init_resource::<UiStack>()
             .configure_sets(
                 PostUpdate,
@@ -214,9 +219,6 @@ impl Plugin for UiPlugin {
                 propagate_ui_target_cameras
                     .in_set(UiSystems::Prepare)
                     .before(bevy_app::TransformGizmoRenderStep),
-                ui_layout_system
-                    .in_set(UiLayoutSystems::Compute)
-                    .ambiguous_with(bevy_sprite::update_text2d_layout),
                 update_border_radius_and_outline_system.in_set(UiLayoutSystems::Resolve),
                 ui_stack_system.in_set(UiSystems::Stack),
                 update_clipping_system.in_set(UiSystems::PostLayout),
@@ -236,6 +238,14 @@ impl Plugin for UiPlugin {
                     .in_set(AmbiguousWithText)
                     .in_set(AmbiguousWithUpdateText2dLayout),
             ),
+        );
+
+        #[cfg(feature = "taffy_layout")]
+        app.add_systems(
+            PostUpdate,
+            ui_layout_system
+                .in_set(UiLayoutSystems::Compute)
+                .ambiguous_with(bevy_sprite::update_text2d_layout),
         );
 
         app.add_plugins(accessibility::AccessibilityPlugin);

@@ -11,7 +11,44 @@ use crate::widget::ImageMeasure;
 
 use crate::widget::TextMeasure;
 
-use crate::{BoxSizing, LayoutContext, Node, UiRect, Val};
+use crate::{BoxSizing, Node, UiRect, Val};
+
+/// What a node's lengths resolve against: the render target's scale factor
+/// and physical size.
+pub struct LayoutContext {
+    pub scale_factor: f32,
+    pub physical_size: Vec2,
+}
+
+impl LayoutContext {
+    pub const DEFAULT: Self = Self {
+        scale_factor: 1.0,
+        physical_size: Vec2::ZERO,
+    };
+    /// Create a new [`LayoutContext`] from the window's physical size and scale factor
+    #[cfg(feature = "taffy_layout")]
+    #[inline]
+    pub(crate) const fn new(scale_factor: f32, physical_size: Vec2) -> Self {
+        Self {
+            scale_factor,
+            physical_size,
+        }
+    }
+}
+
+#[cfg(test)]
+impl LayoutContext {
+    pub const TEST_CONTEXT: Self = Self {
+        scale_factor: 1.0,
+        physical_size: Vec2::new(1000.0, 1000.0),
+    };
+}
+
+impl Default for LayoutContext {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 impl core::fmt::Debug for ContentSize {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {

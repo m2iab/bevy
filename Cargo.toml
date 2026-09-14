@@ -337,7 +337,7 @@ bevy_sprite_render = ["bevy_internal/bevy_sprite_render"]
 bevy_text = ["bevy_internal/bevy_text"]
 
 # A custom ECS-driven UI framework
-bevy_ui = ["bevy_internal/bevy_ui"]
+bevy_ui = ["bevy_internal/bevy_ui", "bevy_internal/taffy_layout"]
 
 # Provides rendering functionality for bevy_ui
 bevy_ui_render = ["bevy_internal/bevy_ui_render"]

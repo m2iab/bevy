@@ -29,6 +29,7 @@ bevy_render = { path = "../bevy_render", version = "0.19.1" }
 bevy_scene = { path = "../bevy_scene", version = "0.19.1" }
 bevy_text = { path = "../bevy_text", version = "0.19.1" }
 bevy_ui = { path = "../bevy_ui", version = "0.19.1", features = [
+  "taffy_layout",
   "bevy_picking",
 ] }
 bevy_ui_render = { path = "../bevy_ui_render", version = "0.19.1" }
