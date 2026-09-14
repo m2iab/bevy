@@ -3,8 +3,8 @@ use crate::experimental::GhostNode;
 use crate::{
     experimental::{UiChildren, UiRootNodes},
     ui_transform::{UiGlobalTransform, UiTransform},
-    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Display, IgnoreScroll, LayoutConfig,
-    Node, Outline, OverflowAxis, ScrollPosition,
+    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, IgnoreScroll, LayoutConfig, Node,
+    OverflowAxis, ScrollPosition,
 };
 #[cfg(feature = "ghost_nodes")]
 use bevy_ecs::query::With;
@@ -91,7 +91,6 @@ pub fn ui_layout_system(
         &mut UiGlobalTransform,
         &Node,
         Option<&LayoutConfig>,
-        Option<&Outline>,
         Option<&ScrollPosition>,
         Option<&IgnoreScroll>,
     )>,
@@ -227,7 +226,6 @@ pub fn ui_layout_system(
             &mut UiGlobalTransform,
             &Node,
             Option<&LayoutConfig>,
-            Option<&Outline>,
             Option<&ScrollPosition>,
             Option<&IgnoreScroll>,
         )>,
@@ -242,7 +240,6 @@ pub fn ui_layout_system(
             mut global_transform,
             style,
             maybe_layout_config,
-            maybe_outline,
             maybe_scroll_position,
             maybe_scroll_sticky,
         )) = node_update_query.get_mut(entity)
@@ -301,43 +298,6 @@ pub fn ui_layout_system(
 
             if inherited_transform != **global_transform {
                 *global_transform = inherited_transform.into();
-            }
-
-            // We don't trigger change detection for changes to border radius
-            node.bypass_change_detection().border_radius = style.border_radius.resolve(
-                inverse_target_scale_factor.recip(),
-                node.size,
-                target_size,
-            );
-
-            if let Some(outline) = maybe_outline {
-                // don't trigger change detection when only outlines are changed
-                let node = node.bypass_change_detection();
-                node.outline_width = if style.display != Display::None {
-                    outline
-                        .width
-                        .resolve(
-                            inverse_target_scale_factor.recip(),
-                            node.size().x,
-                            target_size,
-                        )
-                        .unwrap_or(0.)
-                        .max(0.)
-                } else {
-                    0.
-                };
-
-                node.outline_offset = outline
-                    .offset
-                    .resolve(
-                        inverse_target_scale_factor.recip(),
-                        node.size().x,
-                        target_size,
-                    )
-                    .unwrap_or(0.)
-                    // Clamp outline offsets to at least the length of the node's shorter side
-                    // Negative offset outlines can be useful to create thing like in-set focus indicators
-                    .max(-0.5 * node.size.min_element());
             }
 
             node.bypass_change_detection().scrollbar_size =

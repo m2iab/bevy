@@ -4,13 +4,14 @@ use crate::{
     experimental::{UiChildren, UiRootNodes},
     ui_transform::UiGlobalTransform,
     CalculatedClip, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, DefaultUiCamera, Display,
-    Node, OverrideClip, UiScale, UiTargetCamera,
+    Node, Outline, OverrideClip, UiScale, UiTargetCamera,
 };
 
 use super::ComputedNode;
 use bevy_app::Propagate;
 use bevy_camera::Camera;
 use bevy_ecs::{
+    change_detection::DetectChangesMut,
     entity::Entity,
     query::{Has, Or, With},
     system::{Commands, Query, Res},
@@ -109,6 +110,56 @@ fn update_clipping(
 
     for child in ui_children.iter_ui_children(entity) {
         update_clipping(commands, ui_children, node_query, child, children_clip);
+    }
+}
+
+/// Resolves [`ComputedNode::border_radius`], [`ComputedNode::outline_width`] and
+/// [`ComputedNode::outline_offset`] against each node's computed size.
+///
+/// Runs in [`UiLayoutSystems::Resolve`](crate::UiLayoutSystems::Resolve), after the layout is computed.
+/// These values don't trigger change detection on [`ComputedNode`].
+pub fn update_border_radius_and_outline_system(
+    mut node_query: Query<(
+        &mut ComputedNode,
+        &Node,
+        Option<&Outline>,
+        &ComputedUiRenderTargetInfo,
+    )>,
+) {
+    for (mut node, style, maybe_outline, target) in &mut node_query {
+        // Layout stores the reciprocal of the scale factor on each node and resolves lengths with
+        // the reciprocal of that, so take the same round trip to get bit-identical results.
+        let scale_factor = target.scale_factor().recip().recip();
+        let target_size = target.physical_size().as_vec2();
+
+        // We don't trigger change detection for changes to border radius
+        node.bypass_change_detection().border_radius = style.border_radius.resolve(
+            scale_factor,
+            node.size,
+            target_size,
+        );
+
+        if let Some(outline) = maybe_outline {
+            // don't trigger change detection when only outlines are changed
+            let node = node.bypass_change_detection();
+            node.outline_width = if style.display != Display::None {
+                outline
+                    .width
+                    .resolve(scale_factor, node.size().x, target_size)
+                    .unwrap_or(0.)
+                    .max(0.)
+            } else {
+                0.
+            };
+
+            node.outline_offset = outline
+                .offset
+                .resolve(scale_factor, node.size().x, target_size)
+                .unwrap_or(0.)
+                // Clamp outline offsets to at least the length of the node's shorter side
+                // Negative offset outlines can be useful to create thing like in-set focus indicators
+                .max(-0.5 * node.size.min_element());
+        }
     }
 }
 
@@ -664,5 +715,97 @@ mod tests {
                 .scale_factor(),
             2.
         );
+    }
+
+    #[test]
+    fn border_radius_and_outline_resolve_against_computed_size() {
+        use crate::update::update_border_radius_and_outline_system;
+        use crate::{BorderRadius, ComputedNode, Display, Outline, ResolvedBorderRadius, Val};
+        use bevy_color::Color;
+        use bevy_ecs::{change_detection::DetectChanges, system::RunSystemOnce, world::World};
+        use bevy_math::Vec2;
+
+        let mut world = World::new();
+        let target = ComputedUiRenderTargetInfo {
+            scale_factor: 2.,
+            physical_size: UVec2::new(800, 600),
+        };
+        let computed_node = ComputedNode {
+            size: Vec2::new(200., 100.),
+            ..Default::default()
+        };
+        let border_radius = BorderRadius {
+            top_left: Val::Px(10.),
+            top_right: Val::Percent(20.),
+            bottom_right: Val::Vw(50.),
+            bottom_left: Val::Auto,
+        };
+
+        let outlined = world
+            .spawn((
+                Node {
+                    border_radius,
+                    ..default()
+                },
+                computed_node,
+                target,
+                Outline::new(Val::Px(3.), Val::Percent(-80.), Color::WHITE),
+            ))
+            .id();
+        let hidden = world
+            .spawn((
+                Node {
+                    display: Display::None,
+                    ..default()
+                },
+                computed_node,
+                target,
+                Outline::new(Val::Px(3.), Val::Vh(1.), Color::WHITE),
+            ))
+            .id();
+        let without_outline = world
+            .spawn((
+                Node {
+                    border_radius,
+                    ..default()
+                },
+                computed_node,
+                target,
+            ))
+            .id();
+
+        world.clear_trackers();
+        world
+            .run_system_once(update_border_radius_and_outline_system)
+            .unwrap();
+
+        let resolved_radius = ResolvedBorderRadius {
+            // 10px at a scale factor of 2
+            top_left: 20.,
+            // 20% of the shorter side
+            top_right: 20.,
+            // 50vw, clamped to half of the shorter side
+            bottom_right: 50.,
+            bottom_left: 0.,
+        };
+
+        let node = world.entity(outlined).get_ref::<ComputedNode>().unwrap();
+        assert!(!node.is_changed());
+        assert_eq!(node.border_radius, resolved_radius);
+        assert_eq!(node.outline_width, 6.);
+        // -80% of the width, clamped to half of the shorter side
+        assert_eq!(node.outline_offset, -50.);
+
+        let node = world.entity(hidden).get_ref::<ComputedNode>().unwrap();
+        assert!(!node.is_changed());
+        assert_eq!(node.border_radius, ResolvedBorderRadius::ZERO);
+        assert_eq!(node.outline_width, 0.);
+        // 1vh
+        assert_eq!(node.outline_offset, 6.);
+
+        let node = world.get::<ComputedNode>(without_outline).unwrap();
+        assert_eq!(node.border_radius, resolved_radius);
+        assert_eq!(node.outline_width, 0.);
+        assert_eq!(node.outline_offset, 0.);
     }
 }

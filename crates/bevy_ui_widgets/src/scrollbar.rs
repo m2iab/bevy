@@ -17,9 +17,9 @@ use bevy_math::{Affine2, Vec2};
 use bevy_picking::events::{Cancel, Drag, DragEnd, DragStart, Pointer, Press};
 use bevy_reflect::{prelude::ReflectDefault, Reflect};
 use bevy_ui::{
-    prelude::BorderRect, ui_layout_system, BackgroundColor, BorderColor, BorderRadius,
-    ComputedNode, ComputedUiRenderTargetInfo, ComputedUiTargetCamera, FocusPolicy, ScrollPosition,
-    UiGlobalTransform, UiRect, UiScale, UiSystems, UiTransform, Val, ZIndex,
+    prelude::BorderRect, BackgroundColor, BorderColor, BorderRadius, ComputedNode,
+    ComputedUiRenderTargetInfo, ComputedUiTargetCamera, FocusPolicy, ScrollPosition,
+    UiGlobalTransform, UiLayoutSystems, UiRect, UiScale, UiTransform, Val, ZIndex,
 };
 
 /// Used to select the orientation of a scrollbar, slider, or other oriented control.
@@ -100,7 +100,7 @@ pub struct Scrollbar {
 #[derive(Reflect)]
 #[reflect(Component)]
 pub struct ScrollbarThumb {
-    /// Border radius of the scrollbar thumb, used to update [`ComputedNode::border_radius`] in [`UiSystems::Layout`].
+    /// Border radius of the scrollbar thumb, used to update [`ComputedNode::border_radius`] in [`UiLayoutSystems::Adjust`].
     pub border_radius: BorderRadius,
     /// Thickness of the thumb node's border.
     ///
@@ -469,9 +469,7 @@ impl Plugin for ScrollbarPlugin {
             .add_observer(scrollbar_on_drag)
             .add_systems(
                 PostUpdate,
-                update_scrollbar_thumb
-                    .in_set(UiSystems::Layout)
-                    .after(ui_layout_system),
+                update_scrollbar_thumb.in_set(UiLayoutSystems::Adjust),
             );
     }
 }

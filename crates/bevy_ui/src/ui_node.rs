@@ -47,12 +47,12 @@ pub struct ComputedNode {
     /// If this value is `Auto`, negative or `0.` then no outline will be rendered.
     /// Outline updates bypass change detection.
     ///
-    /// Automatically calculated by [`ui_layout_system`](`super::layout::ui_layout_system`).
+    /// Automatically calculated by [`update_border_radius_and_outline_system`](`crate::update::update_border_radius_and_outline_system`).
     pub outline_width: f32,
     /// The amount of space between the outline and the edge of the node.
     /// Outline updates bypass change detection.
     ///
-    /// Automatically calculated by [`ui_layout_system`](`super::layout::ui_layout_system`).
+    /// Automatically calculated by [`update_border_radius_and_outline_system`](`crate::update::update_border_radius_and_outline_system`).
     pub outline_offset: f32,
     /// The unrounded size of the node as width and height in physical pixels.
     ///
@@ -66,7 +66,7 @@ pub struct ComputedNode {
     /// Resolved border radius values in physical pixels.
     /// Border radius updates bypass change detection.
     ///
-    /// Automatically calculated by [`ui_layout_system`](`super::layout::ui_layout_system`).
+    /// Automatically calculated by [`update_border_radius_and_outline_system`](`crate::update::update_border_radius_and_outline_system`).
     pub border_radius: ResolvedBorderRadius,
     /// Resolved padding values in physical pixels.
     /// Padding updates bypass change detection.

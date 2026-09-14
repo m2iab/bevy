@@ -13,8 +13,8 @@ use bevy_ecs::{
 use bevy_math::{Affine2, Rect, Vec2};
 use bevy_reflect::Reflect;
 use bevy_ui::{
-    ui_layout_system, ComputedNode, ComputedUiRenderTargetInfo, Node, PositionType,
-    UiGlobalTransform, UiSystems, UiTransform, Val2,
+    ComputedNode, ComputedUiRenderTargetInfo, Node, PositionType, UiGlobalTransform,
+    UiLayoutSystems, UiTransform, Val2,
 };
 
 use crate::update_scrollbar_thumb;
@@ -313,8 +313,7 @@ impl Plugin for PopoverPlugin {
         app.add_systems(
             PostUpdate,
             position_popover
-                .in_set(UiSystems::Layout)
-                .after(ui_layout_system)
+                .in_set(UiLayoutSystems::Adjust)
                 .before(update_scrollbar_thumb),
         );
     }

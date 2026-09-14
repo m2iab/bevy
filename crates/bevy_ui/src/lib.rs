@@ -80,11 +80,12 @@ use bevy_app::{prelude::*, AnimationSystems, HierarchyPropagatePlugin, Propagate
 use bevy_camera::CameraUpdateSystems;
 use bevy_ecs::prelude::*;
 use bevy_input::InputSystems;
-use bevy_transform::TransformSystems;
 use layout::ui_surface::UiSurface;
 use stack::ui_stack_system;
 pub use stack::{ComputedStackIndex, UiStack};
-use update::{propagate_ui_target_cameras, update_clipping_system};
+use update::{
+    propagate_ui_target_cameras, update_border_radius_and_outline_system, update_clipping_system,
+};
 
 /// The basic plugin for Bevy UI
 #[derive(Default)]
@@ -105,7 +106,7 @@ pub enum UiSystems {
     Content,
     /// After this label, the ui layout state has been updated.
     ///
-    /// Runs in [`PostUpdate`].
+    /// Runs in [`PostUpdate`]. See [`UiLayoutSystems`] for its stages.
     Layout,
     /// UI systems ordered after [`UiSystems::Layout`].
     ///
@@ -115,6 +116,21 @@ pub enum UiSystems {
     ///
     /// Runs in [`PostUpdate`].
     Stack,
+}
+
+/// The stages of [`UiSystems::Layout`], which run in this order.
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+pub enum UiLayoutSystems {
+    /// Computes the size and position of every UI node.
+    ///
+    /// Contains [`ui_layout_system`].
+    Compute,
+    /// Resolves the computed values that depend on a node's size, such as its border radius and outline.
+    ///
+    /// Contains [`update_border_radius_and_outline_system`].
+    Resolve,
+    /// Adjusts nodes whose placement depends on the computed layout, such as popovers and scrollbar thumbs.
+    Adjust,
 }
 
 /// The current scale of the UI.
@@ -158,6 +174,16 @@ impl Plugin for UiPlugin {
             )
             .configure_sets(
                 PostUpdate,
+                (
+                    UiLayoutSystems::Compute,
+                    UiLayoutSystems::Resolve,
+                    UiLayoutSystems::Adjust,
+                )
+                    .chain()
+                    .in_set(UiSystems::Layout),
+            )
+            .configure_sets(
+                PostUpdate,
                 PropagateSet::<ComputedUiTargetCamera>::default().in_set(UiSystems::Propagate),
             )
             .add_plugins(HierarchyPropagatePlugin::<ComputedUiTargetCamera>::new(
@@ -182,12 +208,6 @@ impl Plugin for UiPlugin {
                 widget::viewport_picking.in_set(PickingSystems::PostInput),
             );
 
-        ui_layout_system
-            .in_set(UiSystems::Layout)
-            .before(TransformSystems::Propagate)
-            // Text and Text2D operate on disjoint sets of entities
-            .ambiguous_with(bevy_sprite::update_text2d_layout);
-
         app.add_systems(
             PostUpdate,
             (
@@ -195,8 +215,9 @@ impl Plugin for UiPlugin {
                     .in_set(UiSystems::Prepare)
                     .before(bevy_app::TransformGizmoRenderStep),
                 ui_layout_system
-                    .in_set(UiSystems::Layout)
+                    .in_set(UiLayoutSystems::Compute)
                     .ambiguous_with(bevy_sprite::update_text2d_layout),
+                update_border_radius_and_outline_system.in_set(UiLayoutSystems::Resolve),
                 ui_stack_system.in_set(UiSystems::Stack),
                 update_clipping_system.in_set(UiSystems::PostLayout),
                 // Potential conflicts: `Assets<Image>`
