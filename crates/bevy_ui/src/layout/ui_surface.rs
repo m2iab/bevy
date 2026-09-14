@@ -13,7 +13,10 @@ use bevy_ecs::{
 use bevy_math::{UVec2, Vec2};
 use bevy_utils::default;
 
-use crate::{layout::convert, LayoutContext, LayoutError, Measure, MeasureArgs, Node, NodeMeasure};
+use crate::{
+    layout::convert, text_measure_buffer, LayoutContext, LayoutError, Measure, MeasureArgs, Node,
+    NodeMeasure,
+};
 use bevy_text::FontCx;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -235,22 +238,26 @@ impl UiSurface {
                  -> taffy::Size<f32> {
                     context
                         .map(|ctx| {
-                            let buffer = get_text_buffer(
+                            let available_width = convert::available_space(available_space.width);
+                            let available_height =
+                                convert::available_space(available_space.height);
+                            let buffer = text_measure_buffer(
                                 crate::widget::TextMeasure::needs_buffer(
                                     known_dimensions.height,
-                                    available_space.width,
+                                    available_width,
                                 ),
                                 ctx,
                                 buffer_query,
                             );
+                            let style = convert::measure_style(style);
                             let size = ctx.measure(MeasureArgs {
                                 known_width: known_dimensions.width,
                                 known_height: known_dimensions.height,
-                                available_width: available_space.width,
-                                available_height: available_space.height,
+                                available_width,
+                                available_height,
                                 font_system,
                                 buffer,
-                                style,
+                                style: &style,
                             });
                             taffy::Size {
                                 width: size.x,
@@ -308,24 +315,6 @@ impl UiSurface {
         self.taffy.enable_rounding();
         out
     }
-}
-
-pub fn get_text_buffer<'a>(
-    needs_buffer: bool,
-    ctx: &mut NodeMeasure,
-    query: &'a mut bevy_ecs::prelude::Query<&mut bevy_text::ComputedTextBlock>,
-) -> Option<&'a mut bevy_text::ComputedTextBlock> {
-    // We avoid a query lookup whenever the buffer is not required.
-    if !needs_buffer {
-        return None;
-    }
-    let NodeMeasure::Text(crate::widget::TextMeasure { info }) = ctx else {
-        return None;
-    };
-    let Ok(computed) = query.get_mut(info.entity) else {
-        return None;
-    };
-    Some(computed.into_inner())
 }
 
 #[cfg(test)]

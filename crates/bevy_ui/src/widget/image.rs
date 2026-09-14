@@ -1,6 +1,7 @@
 use crate::{
-    ComputedUiRenderTargetInfo, ContentSize, Measure, MeasureArgs, Node, NodeMeasure, ResolvedAxis,
-    VisualBox,
+    measurement::{maybe_apply_aspect_ratio, MaybeClamp},
+    BoxSizing, ComputedUiRenderTargetInfo, ContentSize, Measure, MeasureArgs, Node, NodeMeasure,
+    ResolvedAxis, VisualBox,
 };
 use bevy_asset::{AsAssetId, AssetId, Assets, Handle};
 use bevy_color::Color;
@@ -9,7 +10,6 @@ use bevy_image::{prelude::*, TRANSPARENT_IMAGE_HANDLE};
 use bevy_math::{Rect, UVec2, Vec2};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_sprite::TextureSlicer;
-use taffy::{MaybeMath, ResolveOrZero};
 
 /// A UI Node that renders an image.
 #[derive(Component, Clone, Debug, Reflect, FromTemplate)]
@@ -220,27 +220,20 @@ impl Measure for ImageMeasure {
         let mut width = measure_args.resolve_width();
         let mut height = measure_args.resolve_height();
 
-        let calc = |_, _| 0.;
-        let padding = measure_args.style.padding.resolve_or_zero(
-            taffy::Size {
-                width: width.effective,
-                height: height.effective,
-            },
-            calc,
-        );
-        let border = measure_args.style.border.resolve_or_zero(
-            taffy::Size {
-                width: width.effective,
-                height: height.effective,
-            },
-            calc,
-        );
+        let padding = measure_args
+            .style
+            .padding
+            .resolve_or_zero(width.effective, height.effective);
+        let border = measure_args
+            .style
+            .border
+            .resolve_or_zero(width.effective, height.effective);
         let content_inset = Vec2::new(
             padding.left + padding.right + border.left + border.right,
             padding.top + padding.bottom + border.top + border.bottom,
         );
 
-        if measure_args.style.box_sizing == taffy::style::BoxSizing::BorderBox {
+        if measure_args.style.box_sizing == BoxSizing::BorderBox {
             width.min = width.min.map(|min| (min - content_inset.x).max(0.));
             width.preferred = width
                 .preferred
@@ -289,19 +282,14 @@ impl Measure for ImageMeasure {
 
         // Apply aspect ratio
         // If only one of width or height was determined at this point, then the other is set beyond this point using the aspect ratio.
-        let taffy_size = taffy::Size {
-            width: width.effective,
-            height: height.effective,
-        }
-        .maybe_apply_aspect_ratio(Some(aspect_ratio));
+        let (aspect_width, aspect_height) =
+            maybe_apply_aspect_ratio(width.effective, height.effective, Some(aspect_ratio));
 
         (Vec2::new(
-            taffy_size
-                .width
+            aspect_width
                 .unwrap_or(self.size.x)
                 .maybe_clamp(width.min, width.max),
-            taffy_size
-                .height
+            aspect_height
                 .unwrap_or(self.size.y)
                 .maybe_clamp(height.min, height.max),
         ) - inset)

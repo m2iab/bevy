@@ -1,10 +1,11 @@
 use taffy::style_helpers;
 
 use crate::{
-    AlignContent, AlignItems, AlignSelf, BoxSizing, Display, FlexDirection, FlexWrap, GridAutoFlow,
-    GridPlacement, GridTrack, GridTrackRepetition, InlineDirection, JustifyContent, JustifyItems,
-    JustifySelf, MaxTrackSizingFunction, MinTrackSizingFunction, Node, OverflowAxis, PositionType,
-    RepeatedGridTrack, UiRect, Val,
+    AlignContent, AlignItems, AlignSelf, AvailableSpace, BoxSizing, Display, FlexDirection,
+    FlexWrap, GridAutoFlow, GridPlacement, GridTrack, GridTrackRepetition, InlineDirection,
+    JustifyContent, JustifyItems, JustifySelf, MaxTrackSizingFunction, MeasureLength, MeasureRect,
+    MeasureStyle, MinTrackSizingFunction, Node, OverflowAxis, PositionType, RepeatedGridTrack,
+    UiRect, Val,
 };
 
 use super::LayoutContext;
@@ -14,34 +15,18 @@ impl Val {
         self,
         context: &LayoutContext,
     ) -> taffy::style::LengthPercentageAuto {
-        match self {
-            Val::Auto => style_helpers::auto(),
-            Val::Percent(value) => style_helpers::percent(value / 100.),
-            Val::Px(value) => style_helpers::length(context.scale_factor * value),
-            Val::VMin(value) => {
-                style_helpers::length(context.physical_size.min_element() * value / 100.)
-            }
-            Val::VMax(value) => {
-                style_helpers::length(context.physical_size.max_element() * value / 100.)
-            }
-            Val::Vw(value) => style_helpers::length(context.physical_size.x * value / 100.),
-            Val::Vh(value) => style_helpers::length(context.physical_size.y * value / 100.),
+        match MeasureLength::from_val(self, context) {
+            MeasureLength::Auto => style_helpers::auto(),
+            MeasureLength::Px(value) => style_helpers::length(value),
+            MeasureLength::Percent(value) => style_helpers::percent(value),
         }
     }
 
     fn into_length_percentage(self, context: &LayoutContext) -> taffy::style::LengthPercentage {
-        match self {
-            Val::Auto => style_helpers::length(0.0_f32),
-            Val::Percent(value) => style_helpers::percent(value / 100.),
-            Val::Px(value) => style_helpers::length(context.scale_factor * value),
-            Val::VMin(value) => {
-                style_helpers::length(context.physical_size.min_element() * value / 100.)
-            }
-            Val::VMax(value) => {
-                style_helpers::length(context.physical_size.max_element() * value / 100.)
-            }
-            Val::Vw(value) => style_helpers::length(context.physical_size.x * value / 100.),
-            Val::Vh(value) => style_helpers::length(context.physical_size.y * value / 100.),
+        match MeasureLength::from_val(self, context) {
+            MeasureLength::Auto => style_helpers::length(0.0_f32),
+            MeasureLength::Px(value) => style_helpers::length(value),
+            MeasureLength::Percent(value) => style_helpers::percent(value),
         }
     }
 
@@ -141,6 +126,52 @@ pub fn from_node(node: &Node, context: &LayoutContext) -> taffy::style::Style {
         grid_row: node.grid_row.into(),
         grid_column: node.grid_column.into(),
         ..Default::default()
+    }
+}
+
+/// Converts Taffy's available space into the [`AvailableSpace`] passed to a [`Measure`](crate::Measure).
+pub fn available_space(space: taffy::style::AvailableSpace) -> AvailableSpace {
+    match space {
+        taffy::style::AvailableSpace::Definite(value) => AvailableSpace::Definite(value),
+        taffy::style::AvailableSpace::MinContent => AvailableSpace::MinContent,
+        taffy::style::AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+    }
+}
+
+fn measure_length(length: taffy::style::CompactLength) -> MeasureLength {
+    match length.tag() {
+        taffy::style::CompactLength::AUTO_TAG => MeasureLength::Auto,
+        taffy::style::CompactLength::LENGTH_TAG => MeasureLength::Px(length.value()),
+        taffy::style::CompactLength::PERCENT_TAG => MeasureLength::Percent(length.value()),
+        _ => unreachable!("bevy_ui only creates auto, length and percent sizes"),
+    }
+}
+
+fn measure_rect(rect: taffy::geometry::Rect<taffy::style::LengthPercentage>) -> MeasureRect {
+    MeasureRect {
+        left: measure_length(rect.left.into_raw()),
+        right: measure_length(rect.right.into_raw()),
+        top: measure_length(rect.top.into_raw()),
+        bottom: measure_length(rect.bottom.into_raw()),
+    }
+}
+
+/// Converts the parts of a Taffy style read by a [`Measure`](crate::Measure) into a [`MeasureStyle`].
+pub fn measure_style(style: &taffy::style::Style) -> MeasureStyle {
+    MeasureStyle {
+        box_sizing: match style.box_sizing {
+            taffy::style::BoxSizing::BorderBox => BoxSizing::BorderBox,
+            taffy::style::BoxSizing::ContentBox => BoxSizing::ContentBox,
+        },
+        width: measure_length(style.size.width.into_raw()),
+        height: measure_length(style.size.height.into_raw()),
+        min_width: measure_length(style.min_size.width.into_raw()),
+        min_height: measure_length(style.min_size.height.into_raw()),
+        max_width: measure_length(style.max_size.width.into_raw()),
+        max_height: measure_length(style.max_size.height.into_raw()),
+        padding: measure_rect(style.padding),
+        border: measure_rect(style.border),
+        aspect_ratio: style.aspect_ratio,
     }
 }
 
@@ -689,6 +720,156 @@ mod tests {
                 let rhs = length.into_raw().value();
                 (lhs - rhs).abs() < 0.0001
             });
+        }
+    }
+
+    #[test]
+    fn measure_style_from_node_matches_taffy_style() {
+        let contexts = [
+            LayoutContext::new(1.0, Vec2::new(800., 600.)),
+            LayoutContext::new(1.75, Vec2::new(1280., 719.)),
+        ];
+        let nodes = [
+            Node::default(),
+            Node {
+                width: Val::Px(120.),
+                height: Val::Px(40.5),
+                min_width: Val::Px(10.),
+                max_height: Val::Px(300.),
+                ..Default::default()
+            },
+            Node {
+                width: Val::Percent(50.),
+                height: Val::Percent(33.3),
+                min_height: Val::Percent(10.),
+                max_width: Val::Percent(90.),
+                ..Default::default()
+            },
+            Node {
+                width: Val::Vw(25.),
+                height: Val::Vh(12.5),
+                min_width: Val::VMin(5.),
+                max_width: Val::VMax(80.),
+                ..Default::default()
+            },
+            Node {
+                box_sizing: BoxSizing::ContentBox,
+                width: Val::Px(200.),
+                padding: UiRect {
+                    left: Val::Px(3.),
+                    right: Val::Percent(5.),
+                    top: Val::Auto,
+                    bottom: Val::Vh(2.),
+                },
+                border: UiRect {
+                    left: Val::Vw(1.),
+                    right: Val::Auto,
+                    top: Val::Percent(1.5),
+                    bottom: Val::VMax(0.5),
+                },
+                ..Default::default()
+            },
+            Node {
+                box_sizing: BoxSizing::BorderBox,
+                height: Val::Px(64.),
+                padding: UiRect::all(Val::Px(8.)),
+                border: UiRect::all(Val::VMin(1.)),
+                aspect_ratio: Some(16. / 9.),
+                ..Default::default()
+            },
+        ];
+        for context in &contexts {
+            for node in &nodes {
+                let taffy_style = from_node(node, context);
+                assert_eq!(
+                    MeasureStyle::from_node(node, context),
+                    measure_style(&taffy_style)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn measure_helpers_match_taffy() {
+        use crate::measurement::{maybe_apply_aspect_ratio, MaybeClamp};
+        use taffy::{MaybeMath, MaybeResolve, ResolveOrZero};
+
+        let calc = |_, _| 0.;
+        let contexts = [None, Some(0.), Some(250.), Some(-40.)];
+        let dimensions = [
+            taffy::style::Dimension::auto(),
+            taffy::style::Dimension::length(12.5),
+            taffy::style::Dimension::percent(0.4),
+        ];
+        for dimension in dimensions {
+            let length = measure_length(dimension.into_raw());
+            for context in contexts {
+                let resolved: Option<f32> = dimension.maybe_resolve(context, calc);
+                assert_eq!(length.maybe_resolve(context), resolved);
+                let resolved: f32 = dimension.resolve_or_zero(context, calc);
+                assert_eq!(length.resolve_or_zero(context), resolved);
+            }
+        }
+
+        // Left and right resolve against the width, top and bottom against the height.
+        let rect = taffy::geometry::Rect {
+            left: taffy::style::LengthPercentage::length(3.),
+            right: taffy::style::LengthPercentage::percent(0.1),
+            top: taffy::style::LengthPercentage::percent(0.25),
+            bottom: taffy::style::LengthPercentage::length(7.),
+        };
+        let sizes = [
+            (None, None),
+            (Some(200.), None),
+            (None, Some(80.)),
+            (Some(200.), Some(80.)),
+        ];
+        for (width, height) in sizes {
+            let expected: taffy::geometry::Rect<f32> =
+                rect.resolve_or_zero(taffy::Size { width, height }, calc);
+            let resolved = measure_rect(rect).resolve_or_zero(width, height);
+            assert_eq!(
+                (resolved.left, resolved.right, resolved.top, resolved.bottom),
+                (expected.left, expected.right, expected.top, expected.bottom)
+            );
+        }
+
+        let bounds = [None, Some(10.), Some(50.)];
+        for value in [0., 10., 30., 70.] {
+            for min in bounds {
+                for max in bounds {
+                    assert_eq!(
+                        MaybeClamp::maybe_clamp(value, min, max),
+                        <f32 as MaybeMath<Option<f32>, f32>>::maybe_clamp(value, min, max)
+                    );
+                    for value in [None, Some(value)] {
+                        assert_eq!(
+                            MaybeClamp::maybe_clamp(value, min, max),
+                            <Option<f32> as MaybeMath<Option<f32>, Option<f32>>>::maybe_clamp(
+                                value, min, max
+                            )
+                        );
+                    }
+                }
+            }
+        }
+
+        for (width, height) in sizes {
+            for ratio in [None, Some(16. / 9.), Some(0.5)] {
+                let expected = taffy::Size { width, height }.maybe_apply_aspect_ratio(ratio);
+                assert_eq!(
+                    maybe_apply_aspect_ratio(width, height, ratio),
+                    (expected.width, expected.height)
+                );
+            }
+        }
+
+        for space in [
+            taffy::style::AvailableSpace::Definite(42.),
+            taffy::style::AvailableSpace::MinContent,
+            taffy::style::AvailableSpace::MaxContent,
+        ] {
+            assert_eq!(available_space(space).into_option(), space.into_option());
         }
     }
 }

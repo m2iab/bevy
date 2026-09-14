@@ -1,6 +1,6 @@
 use crate::{
-    ComputedNode, ComputedUiRenderTargetInfo, ContentSize, FixedMeasure, Measure, MeasureArgs,
-    Node, NodeMeasure,
+    measurement::MaybeClamp, AvailableSpace, BoxSizing, ComputedNode, ComputedUiRenderTargetInfo,
+    ContentSize, FixedMeasure, Measure, MeasureArgs, Node, NodeMeasure,
 };
 use bevy_asset::Assets;
 use bevy_color::Color;
@@ -23,7 +23,6 @@ use bevy_text::{
     LineHeight, RemSize, ScaleCx, TextBounds, TextColor, TextError, TextFont, TextLayout,
     TextLayoutInfo, TextMeasureInfo, TextPipeline, TextReader, TextSection, TextWriter,
 };
-use taffy::{style::AvailableSpace, MaybeMath, ResolveOrZero};
 use tracing::error;
 
 /// UI text system flags.
@@ -193,14 +192,13 @@ impl Measure for TextMeasure {
         } = measure_args;
 
         // The text is wrapped inside the content box, so subtract horizontal padding and border.
-        if style.box_sizing == taffy::style::BoxSizing::BorderBox {
-            let context = taffy::Size {
-                width: width.effective,
-                height: height.effective,
-            };
-            let calc = |_, _| 0.;
-            let padding = style.padding.resolve_or_zero(context, calc);
-            let border = style.border.resolve_or_zero(context, calc);
+        if style.box_sizing == BoxSizing::BorderBox {
+            let padding = style
+                .padding
+                .resolve_or_zero(width.effective, height.effective);
+            let border = style
+                .border
+                .resolve_or_zero(width.effective, height.effective);
             let total_x_inset = padding.left + padding.right + border.left + border.right;
             width.min = width.min.map(|min| (min - total_x_inset).max(0.));
             width.max = width.max.map(|max| (max - total_x_inset).max(0.));

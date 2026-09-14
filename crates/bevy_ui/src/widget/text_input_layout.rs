@@ -1,7 +1,9 @@
 use core::hash::BuildHasher;
 use core::time::Duration;
 
-use crate::{ComputedNode, ComputedUiRenderTargetInfo, ContentSize, NodeMeasure};
+use crate::{
+    measurement::MaybeClamp, ComputedNode, ComputedUiRenderTargetInfo, ContentSize, NodeMeasure,
+};
 use bevy_asset::Assets;
 
 use bevy_ecs::{
@@ -27,7 +29,6 @@ use bevy_text::{
 use bevy_time::{Real, Time};
 use parley::{BoundingBox, PositionedLayoutItem, StyleProperty};
 use swash::FontRef;
-use taffy::MaybeMath;
 
 #[derive(Component, Clone, Copy, PartialEq, Debug, Default, Reflect)]
 #[reflect(Component, Default, Clone)]
