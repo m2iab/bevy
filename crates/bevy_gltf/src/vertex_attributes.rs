@@ -98,6 +98,9 @@ enum VertexAttributeIter<'a> {
     // Additional on-disk formats used for RGB colors
     U16x3(gltf::accessor::Iter<'a, [u16; 3]>, Normalization),
     U8x3(gltf::accessor::Iter<'a, [u8; 3]>, Normalization),
+    // Additional on-disk formats used for KHR_mesh_quantization normals
+    S16x3(gltf::accessor::Iter<'a, [i16; 3]>, Normalization),
+    S8x3(gltf::accessor::Iter<'a, [i8; 3]>, Normalization),
 }
 
 impl<'a> VertexAttributeIter<'a> {
@@ -132,6 +135,8 @@ impl<'a> VertexAttributeIter<'a> {
             (DataType::U8, Dimensions::Vec4) => acc.with_norm(VertexAttributeIter::U8x4),
             (DataType::U16, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::U16x3),
             (DataType::U8, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::U8x3),
+            (DataType::I16, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::S16x3),
+            (DataType::I8, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::S8x3),
             _ => Err(AccessFailed::UnsupportedFormat),
         }
     }
@@ -189,6 +194,48 @@ impl<'a> VertexAttributeIter<'a> {
                 Ok(n.apply_either(it.collect(), Values::Unorm8x4, Values::Uint8x4))
             }
             _ => Err(AccessFailed::UnsupportedFormat),
+        }
+    }
+
+    /// Materializes normal (`Float32x3`) and tangent (`Float32x4`) values,
+    /// converting the normalized integer formats `KHR_mesh_quantization`
+    /// allows for them (signed 8- and 16-bit) to floats, in the same
+    /// coordinate system as their float forms.
+    fn into_direction_values(self, convert_coordinates: bool) -> Result<Values, AccessFailed> {
+        fn snorm8(v: i8) -> f32 {
+            (v as f32 / 127.0).max(-1.0)
+        }
+        fn snorm16(v: i16) -> f32 {
+            (v as f32 / 32767.0).max(-1.0)
+        }
+        fn convert<T: ConvertCoordinates>(v: Vec<T>, convert_coordinates: bool) -> Vec<T> {
+            if convert_coordinates {
+                v.into_iter()
+                    .map(ConvertCoordinates::convert_coordinates)
+                    .collect()
+            } else {
+                v
+            }
+        }
+        let c = convert_coordinates;
+        match self {
+            VertexAttributeIter::S8x3(it, Normalization(true)) => Ok(Values::Float32x3(convert(
+                it.map(|v| v.map(snorm8)).collect(),
+                c,
+            ))),
+            VertexAttributeIter::S16x3(it, Normalization(true)) => Ok(Values::Float32x3(convert(
+                it.map(|v| v.map(snorm16)).collect(),
+                c,
+            ))),
+            VertexAttributeIter::S8x4(it, Normalization(true)) => Ok(Values::Float32x4(convert(
+                it.map(|v| v.map(snorm8)).collect(),
+                c,
+            ))),
+            VertexAttributeIter::S16x4(it, Normalization(true)) => Ok(Values::Float32x4(convert(
+                it.map(|v| v.map(snorm16)).collect(),
+                c,
+            ))),
+            s => s.into_any_values(c),
         }
     }
 
@@ -253,6 +300,7 @@ impl<'a> VertexAttributeIter<'a> {
 
 enum ConversionMode {
     Any,
+    Direction,
     Rgba,
     JointIndex,
     JointWeight,
@@ -292,12 +340,12 @@ pub fn convert_attribute(
         )),
         gltf::Semantic::Normals => Some((
             Mesh::ATTRIBUTE_NORMAL,
-            ConversionMode::Any,
+            ConversionMode::Direction,
             convert_coordinates,
         )),
         gltf::Semantic::Tangents => Some((
             Mesh::ATTRIBUTE_TANGENT,
-            ConversionMode::Any,
+            ConversionMode::Direction,
             convert_coordinates,
         )),
         gltf::Semantic::Colors(0) => Some((Mesh::ATTRIBUTE_COLOR, ConversionMode::Rgba, false)),
@@ -325,6 +373,7 @@ pub fn convert_attribute(
         let raw_iter = VertexAttributeIter::from_accessor(accessor.clone(), buffer_data);
         let converted_values = raw_iter.and_then(|iter| match conversion {
             ConversionMode::Any => iter.into_any_values(convert_coordinates),
+            ConversionMode::Direction => iter.into_direction_values(convert_coordinates),
             ConversionMode::Rgba => iter.into_rgba_values(),
             ConversionMode::TexCoord => iter.into_tex_coord_values(),
             ConversionMode::JointIndex => iter.into_joint_index_values(),

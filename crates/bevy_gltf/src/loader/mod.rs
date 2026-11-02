@@ -251,7 +251,19 @@ impl GltfLoader {
         settings: &'b GltfLoaderSettings,
     ) -> Result<Gltf, GltfError> {
         let gltf = if settings.validate {
-            gltf::Gltf::from_slice(bytes)?
+            // `KHR_mesh_quantization` is read here (vertex_attributes.rs
+            // turns its normalized integer normals, tangents and texture
+            // coordinates into floats), but gltf-json checks required
+            // extensions against its own list, which lacks it. Take it off
+            // the required list and validate everything else as before.
+            let gltf::Gltf { document, blob } = gltf::Gltf::from_slice_without_validation(bytes)?;
+            let mut json = document.into_json();
+            json.extensions_required
+                .retain(|extension| extension != "KHR_mesh_quantization");
+            gltf::Gltf {
+                document: gltf::Document::from_json(json)?,
+                blob,
+            }
         } else {
             gltf::Gltf::from_slice_without_validation(bytes)?
         };
@@ -2115,7 +2127,9 @@ pub struct MorphTargetNames {
 mod test {
     use std::path::Path;
 
-    use crate::{Gltf, GltfAssetLabel, GltfLoaderSettings, GltfMaterial, GltfNode, GltfSkin};
+    use crate::{
+        Gltf, GltfAssetLabel, GltfLoaderSettings, GltfMaterial, GltfMesh, GltfNode, GltfSkin,
+    };
     use bevy_app::{App, TaskPoolPlugin};
     use bevy_asset::{
         io::{
@@ -2128,7 +2142,7 @@ mod test {
     use bevy_image::{Image, ImageLoaderSettings};
     use bevy_log::LogPlugin;
     use bevy_mesh::skinning::SkinnedMeshInverseBindposes;
-    use bevy_mesh::MeshPlugin;
+    use bevy_mesh::{Mesh, MeshPlugin, VertexAttributeValues};
     use bevy_reflect::TypePath;
     use bevy_world_serialization::WorldSerializationPlugin;
 
@@ -2467,6 +2481,90 @@ mod test {
         });
         let load_state = asset_server.get_load_state(handle_id).unwrap();
         assert!(load_state.is_failed());
+    }
+
+    /// `KHR_mesh_quantization`, required: signed normalized 8-bit normals
+    /// and tangents and unsigned normalized 16-bit texture coordinates load
+    /// as the float attributes the renderer expects, with the spec's
+    /// clamp (-128 reads as -1).
+    #[test]
+    fn mesh_quantization() {
+        let gltf_path = "test.gltf";
+        let app = load_gltf_into_app(
+            gltf_path,
+            r#"
+{
+    "asset": { "version": "2.0" },
+    "extensionsUsed": ["KHR_mesh_quantization"],
+    "extensionsRequired": ["KHR_mesh_quantization"],
+    "meshes": [{
+        "primitives": [{
+            "attributes": { "POSITION": 0, "NORMAL": 1, "TANGENT": 2, "TEXCOORD_0": 3 }
+        }]
+    }],
+    "nodes": [{ "mesh": 0 }],
+    "buffers": [{
+        "uri": "data:application/gltf-buffer;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAB/AACAAAAAAIEAfwAAf38AAH8AfwCBAAAAAP//AAAAAP//",
+        "byteLength": 72
+    }],
+    "bufferViews": [
+        { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+        { "buffer": 0, "byteOffset": 36, "byteLength": 12, "byteStride": 4 },
+        { "buffer": 0, "byteOffset": 48, "byteLength": 12 },
+        { "buffer": 0, "byteOffset": 60, "byteLength": 12 }
+    ],
+    "accessors": [
+        { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+          "min": [0, 0, 0], "max": [1, 1, 0] },
+        { "bufferView": 1, "componentType": 5120, "normalized": true, "count": 3, "type": "VEC3" },
+        { "bufferView": 2, "componentType": 5120, "normalized": true, "count": 3, "type": "VEC4" },
+        { "bufferView": 3, "componentType": 5123, "normalized": true, "count": 3, "type": "VEC2" }
+    ],
+    "scene": 0,
+    "scenes": [{ "nodes": [0] }]
+}
+"#,
+        );
+        let asset_server = app.world().resource::<AssetServer>();
+        let handle = asset_server.load(gltf_path);
+        let gltf_root = app.world().resource::<Assets<Gltf>>().get(&handle).unwrap();
+        let gltf_mesh = app
+            .world()
+            .resource::<Assets<GltfMesh>>()
+            .get(&gltf_root.meshes[0])
+            .unwrap();
+        let mesh = app
+            .world()
+            .resource::<Assets<Mesh>>()
+            .get(&gltf_mesh.primitives[0].mesh)
+            .unwrap();
+        let Some(VertexAttributeValues::Float32x3(normals)) =
+            mesh.attribute(Mesh::ATTRIBUTE_NORMAL)
+        else {
+            panic!("normals load as Float32x3");
+        };
+        assert_eq!(
+            normals,
+            &[[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]
+        );
+        let Some(VertexAttributeValues::Float32x4(tangents)) =
+            mesh.attribute(Mesh::ATTRIBUTE_TANGENT)
+        else {
+            panic!("tangents load as Float32x4");
+        };
+        assert_eq!(
+            tangents,
+            &[
+                [1.0, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, -1.0]
+            ]
+        );
+        let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("texture coordinates load as Float32x2");
+        };
+        assert_eq!(uvs, &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
     }
 
     #[test]
