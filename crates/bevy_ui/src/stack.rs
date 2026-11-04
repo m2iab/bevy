@@ -1,6 +1,7 @@
 //! This module contains the systems that update the stored UI nodes stack
 
 use crate::{
+    closed::{ClosedSubtree, ClosedSubtreeChanges},
     experimental::{UiChildren, UiRootNodes},
     GlobalZIndex, ZIndex,
 };
@@ -64,7 +65,17 @@ pub fn ui_stack_system(
     ui_children: UiChildren,
     zindex_query: Query<Option<&ZIndex>, (With<ComputedStackIndex>, Without<GlobalZIndex>)>,
     mut update_query: Query<&mut ComputedStackIndex>,
+    closed_query: Query<(), With<ClosedSubtree>>,
+    closed_changes: Option<Res<ClosedSubtreeChanges>>,
+    parents: Query<&ChildOf>,
 ) {
+    // A closed node's descendants (closed.rs) are left out of the stack:
+    // nothing draws, picks or focuses them until it opens.
+    let closed_changes = closed_changes.as_deref();
+    let skips_below = |entity: Entity| {
+        closed_changes
+            .is_some_and(|changes| changes.unstacks_below(entity, closed_query.contains(entity)))
+    };
     stack_root_order.clear();
     for (order, partition) in ui_stack.partition.iter().enumerate() {
         stack_root_order.insert(ui_stack.uinodes[partition.start], order);
@@ -95,6 +106,10 @@ pub fn ui_stack_system(
         if visited_stack_roots.contains(&id) {
             continue;
         }
+        // Not out of a closed subtree either.
+        if parents.iter_ancestors(id).any(&skips_below) {
+            continue;
+        }
 
         let previous = stack_root_order.get(&id).copied();
         stack_roots.push((
@@ -121,6 +136,7 @@ pub fn ui_stack_system(
             root_entity,
             &ui_children,
             &zindex_query,
+            &skips_below,
             &mut ui_stack.uinodes,
         );
         let end = ui_stack.uinodes.len();
@@ -139,9 +155,13 @@ fn update_uistack_recursive(
     node_entity: Entity,
     ui_children: &UiChildren,
     zindex_query: &Query<Option<&ZIndex>, (With<ComputedStackIndex>, Without<GlobalZIndex>)>,
+    skips_below: &dyn Fn(Entity) -> bool,
     ui_stack: &mut Vec<Entity>,
 ) {
     ui_stack.push(node_entity);
+    if skips_below(node_entity) {
+        return;
+    }
 
     let start = child_buffer.len();
     child_buffer.extend(
@@ -165,6 +185,7 @@ fn update_uistack_recursive(
             child_entity,
             ui_children,
             zindex_query,
+            skips_below,
             ui_stack,
         );
     }

@@ -1,4 +1,5 @@
 use crate::{
+    closed::{ClosedSubtree, ClosedSubtreeChanges},
     experimental::{UiChildren, UiRootNodes},
     ui_transform::UiGlobalTransform,
     CalculatedClip, ComputedNode, Display, FixedNode, Node, OverrideClip,
@@ -6,7 +7,7 @@ use crate::{
 use bevy_ecs::{
     entity::Entity,
     query::Has,
-    system::{Commands, Query},
+    system::{Commands, Query, Res},
 };
 
 /// Updates clipping for all nodes
@@ -20,14 +21,17 @@ pub fn update_clipping_system(
         Option<&mut CalculatedClip>,
         Has<OverrideClip>,
         Has<FixedNode>,
+        Has<ClosedSubtree>,
     )>,
     ui_children: UiChildren,
+    closed_changes: Option<Res<ClosedSubtreeChanges>>,
 ) {
     for root_node in root_nodes.iter() {
         update_clipping(
             &mut commands,
             &ui_children,
             &mut node_query,
+            closed_changes.as_deref(),
             root_node,
             None,
         );
@@ -44,7 +48,9 @@ fn update_clipping(
         Option<&mut CalculatedClip>,
         Has<OverrideClip>,
         Has<FixedNode>,
+        Has<ClosedSubtree>,
     )>,
+    closed_changes: Option<&ClosedSubtreeChanges>,
     entity: Entity,
     mut maybe_inherited_clip: Option<CalculatedClip>,
 ) {
@@ -55,6 +61,7 @@ fn update_clipping(
         maybe_calculated_clip,
         has_override_clip,
         has_fixed_node,
+        closed,
     )) = node_query.get_mut(entity)
     else {
         return;
@@ -105,11 +112,18 @@ fn update_clipping(
         Some(CalculatedClip::FullyClipped)
     };
 
+    // Beneath a closed node (closed.rs) nothing is drawn: its clips stay as
+    // they were when it closed.
+    if closed_changes.is_some_and(|changes| changes.skips_below(entity, closed)) {
+        return;
+    }
+
     for child in ui_children.iter_ui_children(entity) {
         update_clipping(
             commands,
             ui_children,
             node_query,
+            closed_changes,
             child,
             children_clip.clone(),
         );

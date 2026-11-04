@@ -1,6 +1,7 @@
 #[cfg(feature = "ghost_nodes")]
 use crate::experimental::GhostNode;
 use crate::{
+    closed::{ClosedSubtree, ClosedSubtreeChanges},
     experimental::{UiChildren, UiRootNodes},
     ui_transform::{UiGlobalTransform, UiTransform},
     ComputedNode, ComputedUiRenderTargetInfo, ContentSize, Display, FixedNode, IgnoreScroll,
@@ -129,6 +130,8 @@ pub fn ui_layout_system(
     )>,
     mut buffer_query: Query<&mut ComputedTextBlock>,
     mut font_system: ResMut<FontCx>,
+    closed_query: Query<(), With<ClosedSubtree>>,
+    closed_changes: Option<Res<ClosedSubtreeChanges>>,
     (mut removed_children, mut removed_nodes, mut removed_fixed_nodes): (
         RemovedComponents<Children>,
         RemovedComponents<Node>,
@@ -212,16 +215,35 @@ pub fn ui_layout_system(
         .chain(removed_fixed_nodes.read())
         .collect::<EntityHashSet>();
 
+    // A closed subtree (closed.rs) is skipped once it has been walked closed.
+    let closed_changes = closed_changes.as_deref();
+    let skips_below = |entity: Entity| {
+        closed_changes
+            .is_some_and(|changes| changes.skips_below(entity, closed_query.contains(entity)))
+    };
+
     for ui_root_entity in ui_root_node_query.iter().chain(fixed_nodes_query.iter()) {
+        // Nothing beneath a closed root can be displayed: no layout to sync,
+        // compute or write until it opens.
+        if skips_below(ui_root_entity) {
+            continue;
+        }
         fn update_children_recursively(
             ui_surface: &mut UiSurface,
             ui_children: &UiChildren,
             added_node_query: &Query<(), Added<Node>>,
             fixed_nodes_query: &Query<Entity, (With<FixedNode>, With<ChildOf>)>,
             fixed_node_changes: &EntityHashSet,
+            skips_below: &dyn Fn(Entity) -> bool,
+            closed_changes: Option<&ClosedSubtreeChanges>,
+            reopened: bool,
             entity: Entity,
         ) {
-            let children_changed = ui_children.is_changed(entity)
+            // Children that changed while a subtree was closed were not
+            // synced: an opened subtree syncs every node's children.
+            let reopened = reopened || closed_changes.is_some_and(|changes| changes.opened(entity));
+            let children_changed = reopened
+                || ui_children.is_changed(entity)
                 || ui_children.iter_ui_children(entity).any(|child| {
                     added_node_query.contains(child) || fixed_node_changes.contains(&child)
                 });
@@ -240,6 +262,9 @@ pub fn ui_layout_system(
                 );
             }
 
+            if skips_below(entity) {
+                return;
+            }
             for child in ui_children.iter_ui_children(entity) {
                 if fixed_nodes_query.contains(child) {
                     continue;
@@ -250,6 +275,9 @@ pub fn ui_layout_system(
                     added_node_query,
                     fixed_nodes_query,
                     fixed_node_changes,
+                    skips_below,
+                    closed_changes,
+                    reopened,
                     child,
                 );
             }
@@ -261,6 +289,9 @@ pub fn ui_layout_system(
             &added_node_query,
             &fixed_nodes_query,
             &fixed_node_changes,
+            &skips_below,
+            closed_changes,
+            false,
             ui_root_entity,
         );
 
@@ -285,6 +316,7 @@ pub fn ui_layout_system(
             Affine2::IDENTITY,
             &mut node_update_query,
             &ui_children,
+            &skips_below,
             computed_target.scale_factor.recip(),
             Vec2::ZERO,
             Vec2::ZERO,
@@ -313,6 +345,7 @@ pub fn ui_layout_system(
             Has<FixedNode>,
         )>,
         ui_children: &UiChildren,
+        skips_below: &dyn Fn(Entity) -> bool,
         inverse_target_scale_factor: f32,
         parent_size: Vec2,
         parent_scroll_position: Vec2,
@@ -501,6 +534,9 @@ pub fn ui_layout_system(
                 node.scroll_position = physical_scroll_position;
             }
 
+            if skips_below(entity) {
+                return;
+            }
             for child_uinode in ui_children.iter_ui_children(entity) {
                 update_uinode_geometry_recursive(
                     root,
@@ -511,6 +547,7 @@ pub fn ui_layout_system(
                     inherited_transform,
                     node_update_query,
                     ui_children,
+                    skips_below,
                     inverse_target_scale_factor,
                     layout_size,
                     physical_scroll_position,

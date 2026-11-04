@@ -29,6 +29,11 @@ use bevy_picking::PickingSystems;
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 mod accessibility;
 pub use accessibility::AccessibilityUiSystems;
+mod closed;
+pub use closed::{
+    update_closed_subtrees, ClosedSubtree, ClosedSubtreeChanges, ClosedSubtreeInputs,
+    SkipClosedSubtrees,
+};
 // This module is not re-exported, but is instead made public.
 // This is intended to discourage accidental use of the experimental API.
 pub mod experimental;
@@ -150,6 +155,8 @@ impl Plugin for UiPlugin {
         app.init_resource::<UiSurface>()
             .init_resource::<UiScale>()
             .init_resource::<UiStack>()
+            .init_resource::<SkipClosedSubtrees>()
+            .init_resource::<ClosedSubtreeChanges>()
             .register_required_components::<
                 bevy_text::EditableText,
                 widget::EditableTextContentSizeState,
@@ -195,6 +202,7 @@ impl Plugin for UiPlugin {
         app.add_systems(
             PostUpdate,
             (
+                update_closed_subtrees.in_set(UiSystems::Prepare),
                 propagate_ui_target_cameras
                     .in_set(UiSystems::Prepare)
                     .before(bevy_app::TransformGizmoRenderStep),
