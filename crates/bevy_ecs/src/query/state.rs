@@ -1,5 +1,5 @@
 use crate::{
-    archetype::{Archetype, ArchetypeGeneration, ArchetypeId},
+    archetype::{Archetype, ArchetypeGeneration, ArchetypeId, ArchetypeRecord},
     change_detection::Tick,
     component::ComponentId,
     entity::{Entity, EntityEquivalent, EntitySet, UniqueEntityArray},
@@ -19,6 +19,7 @@ use crate::{
 use crate::entity::UniqueEntityEquivalentSlice;
 
 use alloc::{format, vec::Vec};
+use bevy_platform::collections::HashMap;
 use bevy_utils::prelude::DebugName;
 use core::{fmt, ptr};
 use fixedbitset::FixedBitSet;
@@ -570,12 +571,54 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             let archetypes = world.archetypes();
             let old_generation =
                 core::mem::replace(&mut self.archetype_generation, archetypes.generation());
-
-            for archetype in &archetypes[old_generation..] {
-                // SAFETY: The validate_world call ensures that the world is the same the QueryState
-                // was initialized from.
-                unsafe {
-                    self.new_archetype(archetype);
+            if old_generation == archetypes.generation() {
+                return;
+            }
+            // Nothing the data reads or writes bounds the search (`Query<Entity, With<Marker>>`,
+            // `despawn_all::<With<Marker>>`), but an archetype still has to hold every component
+            // that all of the filter's alternatives are `With`, and the one of those in the
+            // fewest archetypes bounds it as a required component would. Without this the state
+            // walked every archetype of the world: nothing for a system's query, which only
+            // sees the archetypes made since its last run, and a third of a millisecond to a
+            // millisecond a call on a phone for a state built afresh each frame in a world of
+            // four thousand archetypes (`despawn_all` every frame in `clear_screenshots` and
+            // `cleanup_finished_audio`).
+            let mut bounded = false;
+            let mut narrowest: Option<&HashMap<ArchetypeId, ArchetypeRecord>> = None;
+            for component_id in self.component_access.with_in_every_filter_set() {
+                bounded = true;
+                let Some(holders) = archetypes.component_index().get(&component_id) else {
+                    // No archetype holds this component, so none can match.
+                    return;
+                };
+                if narrowest.is_none_or(|narrowest| holders.len() < narrowest.len()) {
+                    narrowest = Some(holders);
+                }
+            }
+            if let Some(holders) = narrowest {
+                // In the order the walk of every archetype took them, so the query iterates
+                // its matches in the order it always did.
+                let mut new: Vec<ArchetypeId> = holders
+                    .keys()
+                    .copied()
+                    .filter(|archetype_id| *archetype_id >= old_generation.0)
+                    .collect();
+                new.sort_unstable();
+                for archetype_id in new {
+                    // SAFETY: the component index only holds archetype ids that are valid for
+                    // the world, and the validate_world call ensures that the world is the same
+                    // the QueryState was initialized from.
+                    unsafe {
+                        self.new_archetype(&archetypes[archetype_id]);
+                    }
+                }
+            } else if !bounded {
+                for archetype in &archetypes[old_generation..] {
+                    // SAFETY: The validate_world call ensures that the world is the same the QueryState
+                    // was initialized from.
+                    unsafe {
+                        self.new_archetype(archetype);
+                    }
                 }
             }
         } else {
@@ -2110,9 +2153,11 @@ mod tests {
         component::Component,
         entity_disabling::DefaultQueryFilters,
         prelude::*,
+        query::{QueryData, QueryFilter},
         system::{QueryLens, RunSystemOnce},
         world::{EntityRef, FilteredEntityMut, FilteredEntityRef},
     };
+    use alloc::vec::Vec;
 
     #[test]
     #[should_panic]
@@ -2627,5 +2672,174 @@ mod tests {
         // But only if the original query was dense
         assert!(!query.is_dense);
         assert_eq!(1, query.query(&world).count());
+    }
+
+    /// A world of every combination of four components, a few entities each.
+    fn world_of_combinations() -> (World, Vec<(Entity, [bool; 4])>) {
+        #[derive(Component)]
+        struct Padding;
+        let mut world = World::new();
+        let mut entities = Vec::new();
+        for bits in 0..16u32 {
+            let has = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0];
+            for _ in 0..=(bits % 3) {
+                let mut entity = world.spawn(Padding);
+                if has[0] {
+                    entity.insert(A(0));
+                }
+                if has[1] {
+                    entity.insert(B(0));
+                }
+                if has[2] {
+                    entity.insert(C(0));
+                }
+                if has[3] {
+                    entity.insert(Rare);
+                }
+                entities.push((entity.id(), has));
+            }
+        }
+        (world, entities)
+    }
+
+    #[derive(Component)]
+    struct Rare;
+
+    #[derive(Component)]
+    struct InNoArchetype;
+
+    /// The entities of `entities` a query finds (the world also holds entities of its own,
+    /// which a filter of `Without` alone matches), beside the ones `expect` picks by hand.
+    fn found<Data: QueryData, Filter: QueryFilter>(
+        world: &mut World,
+        entities: &[(Entity, [bool; 4])],
+        expect: impl Fn([bool; 4]) -> bool,
+    ) -> (Vec<Entity>, Vec<Entity>) {
+        let mut state = world.query_filtered::<(Entity, Data), Filter>();
+        let mut found: Vec<Entity> = state
+            .query(world)
+            .iter()
+            .map(|(e, _)| e)
+            .filter(|e| entities.iter().any(|(spawned, _)| spawned == e))
+            .collect();
+        let mut expected: Vec<Entity> = entities
+            .iter()
+            .filter(|(_, has)| expect(*has))
+            .map(|(e, _)| *e)
+            .collect();
+        found.sort();
+        expected.sort();
+        (found, expected)
+    }
+
+    /// A NEW STATE'S SEARCH IS BOUNDED BY ITS `With` FILTERS as well as by the components its
+    /// data requires, and finds exactly what a walk of every archetype found: a filter alone,
+    /// with a `Without`, beside required data, inside and outside an `Or`, and one whose
+    /// component no archetype holds.
+    #[test]
+    fn a_with_filter_bounds_the_search_and_finds_the_same_entities() {
+        let (mut world, entities) = world_of_combinations();
+        let w = &mut world;
+        let (f, e) = found::<(), With<Rare>>(w, &entities, |h| h[3]);
+        assert!(!e.is_empty());
+        assert_eq!(f, e, "With<Rare>");
+        let (f, e) = found::<(), (With<Rare>, Without<A>)>(w, &entities, |h| h[3] && !h[0]);
+        assert_eq!(f, e, "With<Rare>, Without<A>");
+        let (f, e) = found::<&B, With<Rare>>(w, &entities, |h| h[1] && h[3]);
+        assert_eq!(f, e, "&B, With<Rare>");
+        let (f, e) = found::<Option<&B>, (With<A>, With<Rare>)>(w, &entities, |h| h[0] && h[3]);
+        assert_eq!(f, e, "Option<&B>, With<A>, With<Rare>");
+        let (f, e) = found::<(), Or<(With<Rare>, With<C>)>>(w, &entities, |h| h[3] || h[2]);
+        assert_eq!(f, e, "Or<(With<Rare>, With<C>)>");
+        let (f, e) = found::<(), (With<A>, Or<(With<Rare>, With<C>)>)>(w, &entities, |h| {
+            h[0] && (h[3] || h[2])
+        });
+        assert_eq!(f, e, "With<A>, Or<(With<Rare>, With<C>)>");
+        let (f, e) = found::<(), (With<Rare>, With<InNoArchetype>)>(w, &entities, |_| false);
+        assert_eq!(f, e, "With<InNoArchetype>");
+        let (f, e) = found::<(), Without<Rare>>(w, &entities, |h| !h[3]);
+        assert_eq!(f, e, "Without<Rare>");
+    }
+
+    /// A state bounded by a `With` filter still finds the archetypes made after it: one whose
+    /// component no archetype held when it was built, and one that had matches already.
+    #[test]
+    fn a_bounded_state_finds_the_archetypes_made_since() {
+        let (mut world, _) = world_of_combinations();
+        let mut none_yet = world.query_filtered::<Entity, With<InNoArchetype>>();
+        let mut some = world.query_filtered::<Entity, (With<Rare>, With<A>)>();
+        assert_eq!(none_yet.query(&world).count(), 0);
+        let before = some.query(&world).count();
+        assert!(before > 0);
+
+        let first = world.spawn((InNoArchetype, A(1))).id();
+        let second = world.spawn((InNoArchetype, Rare, A(1), B(1), C(1))).id();
+        let later: Vec<Entity> = none_yet.query(&world).iter().collect();
+        assert_eq!(later.len(), 2);
+        assert!(later.contains(&first) && later.contains(&second));
+        assert_eq!(some.query(&world).count(), before + 1);
+        assert!(some.query(&world).iter().any(|e| e == second));
+        // And again, with nothing new: the same.
+        assert_eq!(none_yet.query(&world).count(), 2);
+        assert_eq!(some.query(&world).count(), before + 1);
+    }
+
+    /// A state bounded by a `With` filter iterates its matches in the order a walk of every
+    /// archetype gives them, as it did before the filter bounded its search.
+    #[test]
+    fn a_bounded_state_iterates_in_the_order_of_a_walk() {
+        let (mut world, entities) = world_of_combinations();
+        // `Without` alone bounds nothing: every archetype is walked.
+        let walked: Vec<Entity> = world
+            .query_filtered::<Entity, Without<InNoArchetype>>()
+            .query(&world)
+            .iter()
+            .collect();
+        for (name, bounded, pick) in [
+            (
+                "With<Rare>",
+                world
+                    .query_filtered::<Entity, With<Rare>>()
+                    .query(&world)
+                    .iter()
+                    .collect(),
+                (|has| has[3]) as fn([bool; 4]) -> bool,
+            ),
+            (
+                "With<Rare>, With<B>, Without<A>",
+                world
+                    .query_filtered::<Entity, (With<Rare>, With<B>, Without<A>)>()
+                    .query(&world)
+                    .iter()
+                    .collect::<Vec<Entity>>(),
+                |has| has[3] && has[1] && !has[0],
+            ),
+        ] {
+            let by_hand: Vec<Entity> = walked
+                .iter()
+                .copied()
+                .filter(|e| {
+                    entities
+                        .iter()
+                        .any(|(spawned, has)| spawned == e && pick(*has))
+                })
+                .collect();
+            assert!(by_hand.len() > 2, "{name}");
+            assert_eq!(bounded, by_hand, "{name}");
+        }
+    }
+
+    /// `despawn_all` with a filter no entity matches leaves the world as it was, whether or
+    /// not any archetype holds the filter's component.
+    #[test]
+    fn despawn_all_with_a_filter_that_matches_nothing_despawns_nothing() {
+        let (mut world, entities) = world_of_combinations();
+        world.despawn_all::<With<InNoArchetype>>();
+        world.despawn_all::<(With<Rare>, With<InNoArchetype>)>();
+        assert!(entities.iter().all(|(e, _)| world.get_entity(*e).is_ok()));
+        world.despawn_all::<(With<Rare>, With<A>)>();
+        for (entity, has) in &entities {
+            assert_eq!(world.get_entity(*entity).is_ok(), !(has[3] && has[0]));
+        }
     }
 }

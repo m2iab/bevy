@@ -764,6 +764,21 @@ impl FilteredAccess {
         }
     }
 
+    /// The components that every alternative of the filter is `With`: an entity without one
+    /// of them matches none of the filter sets, so no archetype without it can match.
+    ///
+    /// `(With<A>, Or<(With<B>, With<C>)>)` yields `A`; `Or<(With<A>, With<B>)>` yields nothing.
+    pub fn with_in_every_filter_set(&self) -> impl Iterator<Item = ComponentId> + '_ {
+        let (first, rest) = self
+            .filter_sets
+            .split_first()
+            .map_or((None, &[][..]), |(first, rest)| (Some(first), rest));
+        first
+            .into_iter()
+            .flat_map(|first| first.with.iter())
+            .filter(move |component_id| rest.iter().all(|set| set.with.contains(*component_id)))
+    }
+
     /// Adds a `Without` filter: corresponds to a conjunction (AND) operation.
     ///
     /// Suppose we begin with `Or<(With<A>, With<B>)>`, which is represented by an array of two `AccessFilter` instances.
@@ -1357,7 +1372,7 @@ impl<I: FusedIterator<Item = usize>> FusedIterator for ComponentIdIter<I> {}
 #[cfg(test)]
 mod tests {
     use crate::{
-        component::ComponentIds,
+        component::{ComponentId, ComponentIds},
         query::{
             access::{AccessFilters, InvertibleComponentIdSet},
             Access, AccessConflicts, ComponentAccessKind, ComponentIdSet, FilteredAccess,
@@ -1366,6 +1381,39 @@ mod tests {
     };
     use alloc::{vec, vec::Vec};
     use fixedbitset::FixedBitSet;
+
+    /// The components every alternative of a filter is `With`: all of a conjunction's, the
+    /// ones an `Or`'s alternatives share, and none where nothing matches.
+    #[test]
+    fn the_components_with_in_every_filter_set() {
+        let ids: Vec<ComponentId> = (0..4).map(ComponentId::new).collect();
+        let common = |access: &FilteredAccess| -> Vec<ComponentId> {
+            access.with_in_every_filter_set().collect()
+        };
+
+        let mut all = FilteredAccess::matches_everything();
+        assert_eq!(common(&all), []);
+        all.and_with(ids[0]);
+        all.and_with(ids[2]);
+        all.and_without(ids[3]);
+        assert_eq!(common(&all), [ids[0], ids[2]]);
+
+        // (With<0>, With<2>) or (With<1>, With<2>): only 2 is in both.
+        let mut other = FilteredAccess::matches_everything();
+        other.and_with(ids[1]);
+        other.and_with(ids[2]);
+        let mut either = all.clone();
+        either.append_or(&other);
+        assert_eq!(common(&either), [ids[2]]);
+
+        // ... or With<3>: nothing is in all three.
+        let mut third = FilteredAccess::matches_everything();
+        third.and_with(ids[3]);
+        either.append_or(&third);
+        assert_eq!(common(&either), []);
+
+        assert_eq!(common(&FilteredAccess::matches_nothing()), []);
+    }
 
     #[test]
     fn test_access_clone() {
