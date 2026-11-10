@@ -209,7 +209,15 @@ impl BundleComponentStatus for SpawnBundleStatus {
 /// [`World`]: crate::world::World
 #[derive(Default)]
 pub struct Edges {
-    insert_bundle: SparseArray<BundleId, ArchetypeAfterBundleInsert>,
+    /// Boxed, because this array is indexed by [`BundleId`]: it is as long as
+    /// the highest id of any bundle ever inserted into an entity of this
+    /// archetype, and nearly all of its slots are empty. Stored inline, an
+    /// empty slot is the size of an [`ArchetypeAfterBundleInsert`] (64 bytes
+    /// on a 64-bit target); boxed, it is one pointer. A world with a few
+    /// thousand archetypes and a few thousand bundles otherwise holds
+    /// hundreds of megabytes of empty slots (measured in a game with 4,100
+    /// archetypes: 200-250 MB of its heap).
+    insert_bundle: SparseArray<BundleId, Box<ArchetypeAfterBundleInsert>>,
     remove_bundle: SparseArray<BundleId, Option<ArchetypeId>>,
     take_bundle: SparseArray<BundleId, Option<ArchetypeId>>,
 }
@@ -233,7 +241,7 @@ impl Edges {
         &self,
         bundle_id: BundleId,
     ) -> Option<&ArchetypeAfterBundleInsert> {
-        self.insert_bundle.get(bundle_id)
+        self.insert_bundle.get(bundle_id).map(|edge| &**edge)
     }
 
     /// Caches the target archetype when inserting a bundle into the source archetype.
@@ -253,13 +261,13 @@ impl Edges {
         added.extend(existing);
         self.insert_bundle.insert(
             bundle_id,
-            ArchetypeAfterBundleInsert {
+            Box::new(ArchetypeAfterBundleInsert {
                 archetype_id,
                 bundle_status: bundle_status.into(),
                 required_components: required_components.into(),
                 added_len,
                 inserted: added.into(),
-            },
+            }),
         );
     }
 
@@ -997,5 +1005,60 @@ impl IndexMut<ArchetypeId> for Archetypes {
     #[inline]
     fn index_mut(&mut self, index: ArchetypeId) -> &mut Self::Output {
         &mut self.archetypes[index.index()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{component::Component, world::World};
+
+    /// `Edges::insert_bundle` is indexed by bundle id and mostly empty, so an
+    /// empty slot must cost a pointer, not a whole edge.
+    #[test]
+    fn an_empty_insert_edge_is_one_pointer() {
+        assert_eq!(
+            size_of::<Option<Box<ArchetypeAfterBundleInsert>>>(),
+            size_of::<usize>()
+        );
+        assert!(size_of::<Option<ArchetypeAfterBundleInsert>>() >= 6 * size_of::<usize>());
+    }
+
+    /// The boxed edge is the one that was cached: an insert that takes an
+    /// entity to another archetype is found again, with the components it
+    /// added and the ones the entity already had.
+    #[test]
+    fn a_cached_insert_edge_is_found_again() {
+        #[derive(Component)]
+        struct A;
+        #[derive(Component)]
+        struct B;
+
+        let mut world = World::new();
+        let entity = world.spawn(A).id();
+        let from = world.entity(entity).archetype().id();
+        world.entity_mut(entity).insert((A, B));
+        let to = world.entity(entity).archetype().id();
+        assert_ne!(from, to);
+
+        let bundle = world
+            .bundles()
+            .get_id(core::any::TypeId::of::<(A, B)>())
+            .unwrap();
+        let edge = world.archetypes()[from]
+            .edges()
+            .get_archetype_after_bundle_insert_internal(bundle)
+            .expect("the insert cached no edge");
+        assert_eq!(edge.archetype_id, to);
+        let a = world.component_id::<A>().unwrap();
+        let b = world.component_id::<B>().unwrap();
+        assert_eq!(edge.added(), [b]);
+        assert_eq!(edge.existing(), [a]);
+        assert_eq!(
+            world.archetypes()[from]
+                .edges()
+                .get_archetype_after_bundle_insert(bundle),
+            Some(to)
+        );
     }
 }
