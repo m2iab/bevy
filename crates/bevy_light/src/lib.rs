@@ -495,6 +495,16 @@ pub fn check_dir_light_mesh_visibility(
         }
     }
 
+    // Nothing to mark (no directional light casts a shadow on a visible mesh): no command. The
+    // command builds a `QueryState` over every archetype that holds a `ViewVisibility`, which is
+    // most of a UI-heavy world's, each time it runs: a millisecond a frame on a phone, spent to
+    // mark nothing.
+    if defer_visible_entities_queue
+        .iter_mut()
+        .all(|entities| entities.is_empty())
+    {
+        return;
+    }
     // Defer marking view visibility so this system can run in parallel with check_point_light_mesh_visibility
     // TODO: use resource to avoid unnecessary memory alloc
     let mut defer_queue = mem::take(defer_visible_entities_queue.deref_mut());
@@ -797,4 +807,81 @@ pub fn get_shadow_lod_origin(
     };
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_app::TaskPoolPlugin;
+    use bevy_ecs::system::RunSystemOnce;
+
+    /// A mesh that casts shadows, not seen from any view so far, and a directional light whose
+    /// one cascade holds everything: the app, the mesh and the light.
+    fn lit(shadow_maps_enabled: bool) -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.add_plugins(TaskPoolPlugin::default());
+        let world = app.world_mut();
+        let view = world.spawn_empty().id();
+        let mesh = world
+            .spawn((
+                Mesh3d::default(),
+                InheritedVisibility::VISIBLE,
+                ViewVisibility::HIDDEN,
+            ))
+            .id();
+        let mut frusta = CascadesFrusta::default();
+        frusta.frusta.insert(view, vec![Frustum::default()]);
+        let light = world
+            .spawn((
+                DirectionalLight {
+                    shadow_maps_enabled,
+                    ..Default::default()
+                },
+                frusta,
+                CascadesVisibleEntities::default(),
+                ViewVisibility::VISIBLE,
+            ))
+            .id();
+        (app, mesh, light)
+    }
+
+    /// The meshes the light's cascades hold.
+    fn held(app: &App, light: Entity) -> Vec<Entity> {
+        app.world()
+            .get::<CascadesVisibleEntities>(light)
+            .unwrap()
+            .entities
+            .values()
+            .flatten()
+            .flat_map(|cascade| cascade.entities.iter().copied())
+            .collect()
+    }
+
+    /// A light that casts shadows still marks the meshes its cascades hold visible, frame after
+    /// frame, through the deferred command.
+    #[test]
+    fn a_shadow_casting_light_marks_the_meshes_it_holds_visible() {
+        let (mut app, mesh, light) = lit(true);
+        for _ in 0..2 {
+            app.world_mut()
+                .run_system_once(check_dir_light_mesh_visibility)
+                .unwrap();
+            assert!(app.world().get::<ViewVisibility>(mesh).unwrap().get());
+            assert_eq!(held(&app, light), [mesh]);
+        }
+    }
+
+    /// A light without shadow maps holds no mesh and marks none: the frames that queue no
+    /// command leave the mesh as it was.
+    #[test]
+    fn a_light_without_shadow_maps_marks_nothing() {
+        let (mut app, mesh, light) = lit(false);
+        for _ in 0..2 {
+            app.world_mut()
+                .run_system_once(check_dir_light_mesh_visibility)
+                .unwrap();
+            assert!(!app.world().get::<ViewVisibility>(mesh).unwrap().get());
+            assert!(held(&app, light).is_empty());
+        }
+    }
 }
