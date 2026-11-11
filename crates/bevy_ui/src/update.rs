@@ -31,6 +31,10 @@ pub fn propagate_ui_target_cameras(
             With<Propagate<ComputedUiRenderTargetInfo>>,
         )>,
     >,
+    current_query: Query<(
+        Option<&Propagate<ComputedUiTargetCamera>>,
+        Option<&Propagate<ComputedUiRenderTargetInfo>>,
+    )>,
 ) {
     let default_camera_entity = default_ui_camera.get();
 
@@ -43,6 +47,10 @@ pub fn propagate_ui_target_cameras(
         }
     }
 
+    // The camera the last root named, with what its target gives: roots
+    // mostly share one camera.
+    let mut resolved: Option<(Option<Entity>, ComputedUiRenderTargetInfo)> = None;
+
     for root_entity in ui_root_nodes.iter() {
         let camera = target_camera_query
             .get(root_entity)
@@ -50,26 +58,44 @@ pub fn propagate_ui_target_cameras(
             .map(UiTargetCamera::entity)
             .or(default_camera_entity);
 
-        commands
-            .entity(root_entity)
-            .try_insert(Propagate(ComputedUiTargetCamera { camera }));
+        let target_info = match resolved {
+            Some((resolved_camera, info)) if resolved_camera == camera => info,
+            _ => {
+                let (scale_factor, physical_size) = camera
+                    .and_then(|camera| camera_query.get(camera).ok())
+                    .map(|camera| {
+                        (
+                            camera.target_scaling_factor().unwrap_or(1.) * ui_scale.0,
+                            camera.physical_viewport_size().unwrap_or(UVec2::ZERO),
+                        )
+                    })
+                    .unwrap_or((1., UVec2::ZERO));
+                let info = ComputedUiRenderTargetInfo {
+                    scale_factor,
+                    physical_size,
+                };
+                resolved = Some((camera, info));
+                info
+            }
+        };
 
-        let (scale_factor, physical_size) = camera
-            .and_then(|camera| camera_query.get(camera).ok())
-            .map(|camera| {
-                (
-                    camera.target_scaling_factor().unwrap_or(1.) * ui_scale.0,
-                    camera.physical_viewport_size().unwrap_or(UVec2::ZERO),
-                )
-            })
-            .unwrap_or((1., UVec2::ZERO));
-
-        commands
-            .entity(root_entity)
-            .try_insert(Propagate(ComputedUiRenderTargetInfo {
-                scale_factor,
-                physical_size,
-            }));
+        // Only what differs is inserted. An insert of the value a root
+        // already holds still marks it changed, and every changed root is
+        // then propagated again: with nothing changed, each root cost two
+        // queued inserts here, two more of `Inherited` and a visit to each
+        // of its children, every frame.
+        let (current_camera, current_info) = current_query.get(root_entity).unwrap_or((None, None));
+        let target_camera = ComputedUiTargetCamera { camera };
+        if current_camera.is_none_or(|current| current.0 != target_camera) {
+            commands
+                .entity(root_entity)
+                .try_insert(Propagate(target_camera));
+        }
+        if current_info.is_none_or(|current| current.0 != target_info) {
+            commands
+                .entity(root_entity)
+                .try_insert(Propagate(target_info));
+        }
     }
 }
 
@@ -122,6 +148,94 @@ mod tests {
         app.add_systems(bevy_app::Update, propagate_ui_target_cameras);
 
         app
+    }
+
+    /// A root whose camera and target did not change is not inserted into
+    /// again, so nothing is propagated from it a second time: every root
+    /// used to be inserted into, and its children visited, every frame.
+    #[test]
+    fn an_unchanged_root_is_not_propagated_again() {
+        use bevy_app::Propagate;
+        use bevy_ecs::{entity::Entity, world::World};
+
+        let mut app = setup_test_app();
+        let world = app.world_mut();
+
+        let camera = world
+            .spawn((
+                Camera2d,
+                Camera {
+                    computed: ComputedCameraValues {
+                        target_info: Some(RenderTargetInfo {
+                            physical_size: UVec2::new(1000, 500),
+                            scale_factor: 2.,
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ))
+            .id();
+        let root = world.spawn(Node::default()).id();
+        let child = world.spawn((Node::default(), ChildOf(root))).id();
+
+        // When each of the four was last written.
+        fn written(
+            world: &World,
+            root: Entity,
+            child: Entity,
+        ) -> [bevy_ecs::change_detection::Tick; 4] {
+            let (root, child) = (world.entity(root), world.entity(child));
+            [
+                root.get_change_ticks::<Propagate<ComputedUiTargetCamera>>()
+                    .unwrap()
+                    .changed,
+                root.get_change_ticks::<Propagate<ComputedUiRenderTargetInfo>>()
+                    .unwrap()
+                    .changed,
+                child
+                    .get_change_ticks::<ComputedUiTargetCamera>()
+                    .unwrap()
+                    .changed,
+                child
+                    .get_change_ticks::<ComputedUiRenderTargetInfo>()
+                    .unwrap()
+                    .changed,
+            ]
+        }
+
+        app.update();
+        app.update();
+        let settled = written(app.world(), root, child);
+        app.update();
+        app.update();
+        assert_eq!(
+            written(app.world(), root, child),
+            settled,
+            "nothing changed, and a root or its child was written again"
+        );
+
+        // A target that does change still reaches the root and its child.
+        app.world_mut()
+            .get_mut::<Camera>(camera)
+            .unwrap()
+            .computed
+            .target_info = Some(RenderTargetInfo {
+            physical_size: UVec2::new(1000, 500),
+            scale_factor: 3.,
+        });
+        app.update();
+        app.update();
+        for entity in [root, child] {
+            assert_eq!(
+                app.world()
+                    .get::<ComputedUiRenderTargetInfo>(entity)
+                    .unwrap()
+                    .scale_factor,
+                3.
+            );
+        }
+        assert_ne!(written(app.world(), root, child)[1], settled[1]);
     }
 
     #[test]
