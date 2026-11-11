@@ -134,21 +134,28 @@ pub fn mark_dirty_trees(
 
     // Simple serial implementation that iterates changed entities and traverses the tree.
     #[cfg(not(feature = "multi_threaded"))]
-    for entity in changed.iter().chain(orphaned.read()) {
-        let mut next = entity;
-        while let Ok(mut tree) = transforms.get_mut(next) {
-            if tree.is_changed() && !tree.is_added() {
-                // If the component was changed, this part of the tree has already been processed.
-                // Ignore this if the change was caused by the component being added.
-                break;
-            }
-            tree.set_changed();
-            if let Ok(parent) = parents.get(next).map(ChildOf::parent) {
-                next = parent;
-            } else {
-                break;
-            };
-        }
+    mark_dirty_trees_serial(
+        changed.iter().chain(orphaned.read()),
+        &mut transforms,
+        &parents,
+    );
+
+    // A pool of one thread has nothing to run the pipeline below on: its producer, its
+    // traversal and its consumer are three sets of tasks handing entities to each other through
+    // channels, and on one worker they take turns. An application that gives the compute pool a
+    // single thread (a phone whose big cores are busy with the main and render threads) paid for
+    // the hand-offs and got no parallelism: measured in Orbit Jumper's menu on an M4 Pro with a
+    // pool of one, 1.13 ms a frame here against 0.11 ms with a pool of six, and nothing to mark
+    // in most of those frames. With fewer than two threads the serial walk above is the whole
+    // job.
+    #[cfg(feature = "multi_threaded")]
+    if bevy_tasks::ComputeTaskPool::get().thread_num() < 2 {
+        mark_dirty_trees_serial(
+            changed.iter().chain(orphaned.read()),
+            &mut transforms,
+            &parents,
+        );
+        return;
     }
 
     // Concurrent and parallel implementation with three sets of asynchronous workers:
@@ -301,6 +308,31 @@ pub fn mark_dirty_trees(
         // would shrink the length to 0 and force every entity through the overflow path next frame.
         for w in shared_bitset.iter() {
             w.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Marks each of `changed` and its ancestors, stopping a climb at the first entity another
+/// climb has already marked this run.
+fn mark_dirty_trees_serial(
+    changed: impl Iterator<Item = Entity>,
+    transforms: &mut Query<&mut TransformTreeChanged>,
+    parents: &Query<&ChildOf>,
+) {
+    for entity in changed {
+        let mut next = entity;
+        while let Ok(mut tree) = transforms.get_mut(next) {
+            if tree.is_changed() && !tree.is_added() {
+                // If the component was changed, this part of the tree has already been processed.
+                // Ignore this if the change was caused by the component being added.
+                break;
+            }
+            tree.set_changed();
+            if let Ok(parent) = parents.get(next).map(ChildOf::parent) {
+                next = parent;
+            } else {
+                break;
+            };
         }
     }
 }
@@ -822,6 +854,112 @@ mod test {
     use bevy_tasks::{ComputeTaskPool, TaskPool};
 
     use crate::systems::*;
+
+    /// What the last run of a schedule marked.
+    #[derive(Resource, Default)]
+    struct Marked(Vec<Entity>);
+
+    fn record_marked(
+        marked: Query<Entity, Changed<TransformTreeChanged>>,
+        mut out: ResMut<Marked>,
+    ) {
+        out.0 = marked.iter().collect();
+        out.0.sort();
+    }
+
+    /// The serial marking alone, as `mark_dirty_trees` runs it on a pool of one thread.
+    fn mark_serially(
+        changed: Query<Entity, Or<(Changed<Transform>, Changed<ChildOf>, Added<GlobalTransform>)>>,
+        mut orphaned: RemovedComponents<ChildOf>,
+        mut transforms: Query<&mut TransformTreeChanged>,
+        parents: Query<&ChildOf>,
+    ) {
+        mark_dirty_trees_serial(
+            changed.iter().chain(orphaned.read()),
+            &mut transforms,
+            &parents,
+        );
+    }
+
+    /// A pool of one thread takes the serial walk, and it marks what the pipeline marks: a
+    /// moved leaf and every ancestor of it, a reparented subtree's root and the trees it left
+    /// and joined, and nothing in a tree that did not change.
+    #[test]
+    fn the_serial_marking_marks_what_the_pipeline_marks() {
+        ComputeTaskPool::get_or_init(TaskPool::default);
+
+        // Two trees of three and a loose entity: (roots, middles, leaves, loose).
+        fn scene(world: &mut World) -> ([Entity; 2], [Entity; 2], [Entity; 2], Entity) {
+            let mut spawn = |parent: Option<Entity>| {
+                let entity = world.spawn(Transform::default()).id();
+                if let Some(parent) = parent {
+                    world.entity_mut(entity).insert(ChildOf(parent));
+                }
+                entity
+            };
+            let roots = [spawn(None), spawn(None)];
+            let middles = [spawn(Some(roots[0])), spawn(Some(roots[1]))];
+            let leaves = [spawn(Some(middles[0])), spawn(Some(middles[1]))];
+            (roots, middles, leaves, spawn(None))
+        }
+
+        let mut marks: Vec<Vec<Vec<Entity>>> = Vec::new();
+        for serial in [false, true] {
+            let mut world = World::default();
+            world.insert_resource(StaticTransformOptimizations::default());
+            world.init_resource::<Marked>();
+            let mut schedule = Schedule::default();
+            if serial {
+                schedule.add_systems((mark_serially, record_marked).chain());
+            } else {
+                schedule.add_systems((mark_dirty_trees, record_marked).chain());
+            }
+            let (roots, middles, leaves, loose) = scene(&mut world);
+            let mut steps = Vec::new();
+            let mut step = |world: &mut World, schedule: &mut Schedule| {
+                schedule.run(world);
+                steps.push(world.resource::<Marked>().0.clone());
+            };
+            // Everything new is marked once, then nothing.
+            step(&mut world, &mut schedule);
+            step(&mut world, &mut schedule);
+            // A leaf moves: it and its ancestors, and nothing of the other tree.
+            world.get_mut::<Transform>(leaves[0]).unwrap().translation.x = 1.0;
+            step(&mut world, &mut schedule);
+            // Two entities of one tree move: its root is marked once.
+            world.get_mut::<Transform>(leaves[1]).unwrap().translation.x = 1.0;
+            world
+                .get_mut::<Transform>(middles[1])
+                .unwrap()
+                .translation
+                .x = 1.0;
+            step(&mut world, &mut schedule);
+            // A subtree changes trees, and a loose entity moves.
+            world.entity_mut(middles[0]).insert(ChildOf(roots[1]));
+            world.get_mut::<Transform>(loose).unwrap().translation.x = 1.0;
+            step(&mut world, &mut schedule);
+            // An entity is orphaned.
+            world.entity_mut(leaves[1]).remove::<ChildOf>();
+            step(&mut world, &mut schedule);
+
+            let mut expected = vec![roots[0], middles[0], leaves[0]];
+            expected.sort();
+            assert_eq!(
+                steps[1],
+                Vec::new(),
+                "nothing changed, and something was marked"
+            );
+            assert_eq!(
+                steps[2], expected,
+                "a moved leaf did not mark exactly its own tree"
+            );
+            marks.push(steps);
+        }
+        assert_eq!(
+            marks[0], marks[1],
+            "the serial marking and `mark_dirty_trees` marked different entities"
+        );
+    }
 
     #[test]
     fn correct_parent_removed() {
