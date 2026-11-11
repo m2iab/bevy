@@ -9,13 +9,16 @@ use crate::{
 };
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
+    component::Component,
     entity::{Entity, EntityHashSet},
     hierarchy::{ChildOf, Children},
     lifecycle::RemovedComponents,
-    query::{Added, Has, With},
+    query::{Added, Has, With, Without},
+    reflect::ReflectComponent,
     system::{Query, Res, ResMut},
     world::Ref,
 };
+use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 
 use bevy_math::{Affine2, Vec2};
 use bevy_sprite::BorderRect;
@@ -75,6 +78,30 @@ impl Default for LayoutContext {
     }
 }
 
+/// On a UI node that something other than [`ui_layout_system`] lays out.
+///
+/// [`ui_layout_system`] leaves such a node alone: it is not given a node in
+/// the layout tree, takes no part in its parent's layout (as if it were not
+/// a child), and neither its [`ComputedNode`] nor its [`UiGlobalTransform`]
+/// is written. Nothing beneath it is visited either, so mark every node of a
+/// tree laid out elsewhere, not only its root. Whatever lays it out writes
+/// both components itself, in [`UiSystems::Layout`](crate::UiSystems::Layout);
+/// clipping, the stack, picking and rendering then read them as they read
+/// any node's.
+///
+/// A layout that owns whole trees otherwise pays for two: this one walks
+/// every node each frame, writes what it computed, and the owner writes its
+/// own results back over them.
+///
+/// A node marked after it was laid out here is taken out of the layout tree
+/// on the next run, its measure function with it. A node whose mark is
+/// removed is laid out here again from that run on; a [`ContentSize`]
+/// measure taken while it was first laid out is not restored until the
+/// content sets it again.
+#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq, Reflect)]
+#[reflect(Component, Default, Debug, Clone, PartialEq)]
+pub struct ExternalLayout;
+
 /// For any entity with a [`TextFont`], set [`EmSize`] to the font size resolved
 /// into pixels when the `TextFont`, render target or `RemSize` changes. Nodes
 /// without `TextFont` keep their `EmSize` intact. If `TextFont` is removed the
@@ -107,31 +134,42 @@ pub fn ui_layout_system(
     ui_root_node_query: UiRootNodes,
     fixed_nodes_query: Query<Entity, (With<FixedNode>, With<ChildOf>)>,
     ui_children: UiChildren,
-    mut node_query: Query<(
-        Entity,
-        Ref<Node>,
-        Ref<EmSize>,
-        &mut ContentSize,
-        Ref<ComputedUiRenderTargetInfo>,
-    )>,
+    mut node_query: Query<
+        (
+            Entity,
+            Ref<Node>,
+            Ref<EmSize>,
+            &mut ContentSize,
+            Ref<ComputedUiRenderTargetInfo>,
+        ),
+        Without<ExternalLayout>,
+    >,
     added_node_query: Query<(), Added<Node>>,
     added_fixed_node_query: Query<Entity, Added<FixedNode>>,
-    mut node_update_query: Query<(
-        &mut ComputedNode,
-        &UiTransform,
-        &mut UiGlobalTransform,
-        &Node,
-        &EmSize,
-        Option<&LayoutConfig>,
-        Option<&Outline>,
-        Option<&ScrollPosition>,
-        Option<&IgnoreScroll>,
-        Has<FixedNode>,
-    )>,
+    mut node_update_query: Query<
+        (
+            &mut ComputedNode,
+            &UiTransform,
+            &mut UiGlobalTransform,
+            &Node,
+            &EmSize,
+            Option<&LayoutConfig>,
+            Option<&Outline>,
+            Option<&ScrollPosition>,
+            Option<&IgnoreScroll>,
+            Has<FixedNode>,
+        ),
+        Without<ExternalLayout>,
+    >,
     mut buffer_query: Query<&mut ComputedTextBlock>,
     mut font_system: ResMut<FontCx>,
     closed_query: Query<(), With<ClosedSubtree>>,
     closed_changes: Option<Res<ClosedSubtreeChanges>>,
+    (external_query, added_external_query, mut removed_external): (
+        Query<(), With<ExternalLayout>>,
+        Query<Entity, Added<ExternalLayout>>,
+        RemovedComponents<ExternalLayout>,
+    ),
     (mut removed_children, mut removed_nodes, mut removed_fixed_nodes): (
         RemovedComponents<Children>,
         RemovedComponents<Node>,
@@ -148,6 +186,13 @@ pub fn ui_layout_system(
     // `Val::Rem` resolves from rem size so need to recalc when this changes
     let rem_size_changed = rem_size.is_changed();
 
+    // A node laid out elsewhere (`ExternalLayout`) has no place in the layout
+    // tree: one marked since the last run leaves it, and its parent's layout
+    // with it.
+    ui_surface.remove_entities(added_external_query.iter());
+    // One whose mark was removed is laid out here again, as if it were new.
+    let returned = removed_external.read().collect::<EntityHashSet>();
+
     // Sync Node and ContentSize to Taffy for all nodes
     node_query.iter_mut().for_each(
         |(entity, node, em_size, mut content_size, computed_target)| {
@@ -156,6 +201,7 @@ pub fn ui_layout_system(
                 || content_size.is_changed()
                 || rem_size_changed
                 || em_size.is_changed()
+                || (!returned.is_empty() && returned.contains(&entity))
             {
                 let layout_context = LayoutContext::new(
                     computed_target.scale_factor,
@@ -223,6 +269,11 @@ pub fn ui_layout_system(
     };
 
     for ui_root_entity in ui_root_node_query.iter().chain(fixed_nodes_query.iter()) {
+        // A root laid out elsewhere is not this system's to sync, compute or
+        // write.
+        if external_query.contains(ui_root_entity) {
+            continue;
+        }
         // Nothing beneath a closed root can be displayed: no layout to sync,
         // compute or write until it opens.
         if skips_below(ui_root_entity) {
@@ -234,6 +285,8 @@ pub fn ui_layout_system(
             added_node_query: &Query<(), Added<Node>>,
             fixed_nodes_query: &Query<Entity, (With<FixedNode>, With<ChildOf>)>,
             fixed_node_changes: &EntityHashSet,
+            external_query: &Query<(), With<ExternalLayout>>,
+            returned: &EntityHashSet,
             skips_below: &dyn Fn(Entity) -> bool,
             closed_changes: Option<&ClosedSubtreeChanges>,
             reopened: bool,
@@ -245,7 +298,9 @@ pub fn ui_layout_system(
             let children_changed = reopened
                 || ui_children.is_changed(entity)
                 || ui_children.iter_ui_children(entity).any(|child| {
-                    added_node_query.contains(child) || fixed_node_changes.contains(&child)
+                    added_node_query.contains(child)
+                        || fixed_node_changes.contains(&child)
+                        || returned.contains(&child)
                 });
             #[cfg(feature = "ghost_nodes")]
             let children_changed =
@@ -266,7 +321,10 @@ pub fn ui_layout_system(
                 return;
             }
             for child in ui_children.iter_ui_children(entity) {
-                if fixed_nodes_query.contains(child) {
+                // A child laid out elsewhere is not in the layout tree
+                // (`update_children` leaves it out), and nothing beneath it
+                // is this system's.
+                if fixed_nodes_query.contains(child) || external_query.contains(child) {
                     continue;
                 }
                 update_children_recursively(
@@ -275,6 +333,8 @@ pub fn ui_layout_system(
                     added_node_query,
                     fixed_nodes_query,
                     fixed_node_changes,
+                    external_query,
+                    returned,
                     skips_below,
                     closed_changes,
                     reopened,
@@ -289,6 +349,8 @@ pub fn ui_layout_system(
             &added_node_query,
             &fixed_nodes_query,
             &fixed_node_changes,
+            &external_query,
+            &returned,
             &skips_below,
             closed_changes,
             false,
@@ -332,18 +394,21 @@ pub fn ui_layout_system(
         inherited_use_rounding: bool,
         target_size: Vec2,
         mut inherited_transform: Affine2,
-        node_update_query: &mut Query<(
-            &mut ComputedNode,
-            &UiTransform,
-            &mut UiGlobalTransform,
-            &Node,
-            &EmSize,
-            Option<&LayoutConfig>,
-            Option<&Outline>,
-            Option<&ScrollPosition>,
-            Option<&IgnoreScroll>,
-            Has<FixedNode>,
-        )>,
+        node_update_query: &mut Query<
+            (
+                &mut ComputedNode,
+                &UiTransform,
+                &mut UiGlobalTransform,
+                &Node,
+                &EmSize,
+                Option<&LayoutConfig>,
+                Option<&Outline>,
+                Option<&ScrollPosition>,
+                Option<&IgnoreScroll>,
+                Has<FixedNode>,
+            ),
+            Without<ExternalLayout>,
+        >,
         ui_children: &UiChildren,
         skips_below: &dyn Fn(Entity) -> bool,
         inverse_target_scale_factor: f32,
@@ -650,6 +715,113 @@ mod tests {
         ));
 
         app
+    }
+
+    /// Where a node's centre sits across the target.
+    fn center_x(world: &World, entity: Entity) -> f32 {
+        world
+            .get::<UiGlobalTransform>(entity)
+            .unwrap()
+            .translation
+            .x
+    }
+
+    /// A node laid out elsewhere has no node in the layout tree, takes no
+    /// room in its parent and is never written, nor is anything beneath it.
+    #[test]
+    fn a_node_laid_out_elsewhere_is_left_alone() {
+        use crate::{ComputedNode, ExternalLayout};
+
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+
+        let sized = |width: f32| Node {
+            width: Val::Px(width),
+            height: Val::Px(100.),
+            ..default()
+        };
+        let root = world.spawn(sized(300.)).id();
+        let external = world
+            .spawn((sized(100.), ExternalLayout, ChildOf(root)))
+            .id();
+        let beneath = world
+            .spawn((sized(10.), ExternalLayout, ChildOf(external)))
+            .id();
+        let plain = world.spawn((sized(50.), ChildOf(root))).id();
+        // What its owner wrote.
+        let written = ComputedNode {
+            size: Vec2::new(7., 9.),
+            ..Default::default()
+        };
+        world.entity_mut(external).insert(written);
+
+        app.update();
+        app.update();
+
+        let world = app.world();
+        let surface = world.resource::<UiSurface>();
+        assert!(surface.entity_to_taffy.contains_key(&root));
+        assert!(surface.entity_to_taffy.contains_key(&plain));
+        assert!(!surface.entity_to_taffy.contains_key(&external));
+        assert!(!surface.entity_to_taffy.contains_key(&beneath));
+        assert_eq!(*world.get::<ComputedNode>(external).unwrap(), written);
+        assert_eq!(
+            world.get::<ComputedNode>(beneath).unwrap().size,
+            Vec2::ZERO,
+            "a node beneath one laid out elsewhere was laid out here"
+        );
+        // The plain child is the row's first: the other takes no room in it.
+        assert_eq!(world.get::<ComputedNode>(plain).unwrap().size.x, 50.);
+        assert_eq!(center_x(world, plain), 25.);
+    }
+
+    /// A node marked after it was laid out here leaves the layout tree and
+    /// its parent's layout; one whose mark is removed is laid out here again.
+    #[test]
+    fn a_node_marked_later_leaves_the_layout_and_returns_unmarked() {
+        use crate::{ComputedNode, ExternalLayout};
+
+        let mut app = setup_ui_test_app();
+        let world = app.world_mut();
+
+        let sized = |width: f32| Node {
+            width: Val::Px(width),
+            height: Val::Px(100.),
+            ..default()
+        };
+        let root = world.spawn(sized(300.)).id();
+        let first = world.spawn((sized(100.), ChildOf(root))).id();
+        let second = world.spawn((sized(50.), ChildOf(root))).id();
+
+        app.update();
+        assert_eq!(center_x(app.world(), first), 50.);
+        assert_eq!(center_x(app.world(), second), 125.);
+
+        app.world_mut().entity_mut(first).insert(ExternalLayout);
+        app.update();
+        let world = app.world();
+        assert!(!world
+            .resource::<UiSurface>()
+            .entity_to_taffy
+            .contains_key(&first));
+        assert_eq!(
+            center_x(world, second),
+            25.,
+            "the row still holds room for a child laid out elsewhere"
+        );
+        // It keeps what it had: nothing here writes it any more.
+        assert_eq!(world.get::<ComputedNode>(first).unwrap().size.x, 100.);
+        assert_eq!(center_x(world, first), 50.);
+
+        app.world_mut().entity_mut(first).remove::<ExternalLayout>();
+        app.update();
+        let world = app.world();
+        assert!(world
+            .resource::<UiSurface>()
+            .entity_to_taffy
+            .contains_key(&first));
+        assert_eq!(center_x(world, first), 50.);
+        assert_eq!(center_x(world, second), 125.);
     }
 
     #[test]
